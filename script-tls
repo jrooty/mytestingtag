@@ -12,7 +12,8 @@ CA_CERT=""
 FILE=""
 BIGIP_MODE=0
 LOCAL_FULL=0
-TMP_MEMS=""
+TMP_MEMS=$(mktemp)
+TMP_AS3=$(mktemp)
 
 sleep_ms() { sleep "$(awk "BEGIN {printf \"%.3f\", $1/1000}")"; }
 
@@ -27,97 +28,57 @@ colorize_status() {
 }
 
 # ------------------------------
-# Récupération des VS et pools (directs + LTP statiques)
+# 1️⃣ Récupérer pools et pool members via iControl REST
 # ------------------------------
-fetch_bigip_local_vs() {
+fetch_pools_icontrol() {
     TMP_JSON=$(mktemp)
-    curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
+    curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_JSON"
 
-    TMP_MEMS=$(mktemp)
-    if command -v jq >/dev/null 2>&1; then
-        mapfile -t VS_LIST < <(jq -r '.items[] | "\(.name) \(.destination) \(.pool) \(.profilesReference.link) \(.type) \(.policiesReference.link)"' "$TMP_JSON")
-        for vs in "${VS_LIST[@]}"; do
-            VS_NAME="${vs%% *}"
-            rest="${vs#* }"
-            DEST="${rest%% *}"
-            rest2="${rest#* }"
-            POOL_DIRECT="${rest2%% *}"
-            rest3="${rest2#* }"
-            PROFILES_LINK="${rest3%% *}"
-            rest4="${rest3#* }"
-            VS_TYPE="${rest4%% *}"
-            POLICIES_LINK="${rest4#* }"
-
-            # Mode local: filtrage fastl4 + SSL/C3D
-            if [ "$LOCAL_FULL" -eq 0 ]; then
-                [ "$VS_TYPE" = "fastl4" ] && continue
-                if [ "$PROFILES_LINK" != "null" ]; then
-                    PROFILES_JSON=$(mktemp)
-                    curl -sS --insecure -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
-                    if ! jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
-                        rm -f "$PROFILES_JSON"
-                        continue
-                    fi
-                    rm -f "$PROFILES_JSON"
-                fi
-            fi
-
-            # Collecte pools directs
-            POOLS=()
-            [ "$POOL_DIRECT" != "null" ] && POOLS+=("$POOL_DIRECT")
-
-            # Collecte pools via LTP (statiques seulement)
-            if [ "$POLICIES_LINK" != "null" ]; then
-                POL_JSON=$(mktemp)
-                curl -sS --insecure -u admin: "$POLICIES_LINK" -o "$POL_JSON"
-                mapfile -t POLICY_ITEMS < <(jq -r '.items[]?.name' "$POL_JSON")
-                rm -f "$POL_JSON"
-
-                for pol in "${POLICY_ITEMS[@]}"; do
-                    RULES_JSON=$(mktemp)
-                    curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/policy/$pol/rules" -o "$RULES_JSON"
-
-                    # Extraire pools statiques (forward.pool ou select.pool)
-                    RULE_POOLS=()
-                    mapfile -t RULE_POOLS < <(jq -r '.items[]?.actions[]? | select(.forward?.pool) | .forward.pool' "$RULES_JSON")
-                    mapfile -t SELECT_POOLS < <(jq -r '.items[]?.actions[]? | select(.select?.pool) | .select.pool' "$RULES_JSON")
-                    RULE_POOLS+=("${SELECT_POOLS[@]}")
-
-                    if [ "${#RULE_POOLS[@]}" -eq 0 ]; then
-                        echo "[WARN] VS=$VS_NAME, policy=$pol : aucune pool statique détectée (peut être dynamique)"
-                    fi
-
-                    POOLS+=("${RULE_POOLS[@]}")
-                    rm -f "$RULES_JSON"
-                done
-            fi
-
-            # Si pas de pool, log info
-            if [ "${#POOLS[@]}" -eq 0 ]; then
-                echo "[INFO] VS=$VS_NAME n'a pas de pool, aucun test TCP/TLS"
-                continue
-            fi
-
-            # Récupérer tous les pool members
-            for pool in "${POOLS[@]}"; do
-                POOL_JSON=$(mktemp)
-                curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$pool/members?expandSubcollections=true" -o "$POOL_JSON"
-                mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
-                rm -f "$POOL_JSON"
-                for mem in "${MEMBERS[@]}"; do
-                    echo "$VS_NAME $mem" >> "$TMP_MEMS"
-                done
-            done
+    > "$TMP_MEMS"
+    mapfile -t POOLS < <(jq -r '.items[].name' "$TMP_JSON")
+    for pool in "${POOLS[@]}"; do
+        POOL_JSON=$(mktemp)
+        curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/${pool}/members" -o "$POOL_JSON"
+        mapfile -t MEMBERS < <(jq -r ".items[] | \"${pool} \(.name)\"" "$POOL_JSON")
+        for mem in "${MEMBERS[@]}"; do
+            echo "$mem" >> "$TMP_MEMS"
         done
-    fi
-    FILE="$TMP_MEMS"
+        rm -f "$POOL_JSON"
+    done
+    rm -f "$TMP_JSON"
 }
 
 # ------------------------------
-# Test TCP/TLS/mTLS
+# 2️⃣ Récupérer déclaration AS3 via HTTP / admin:
+# ------------------------------
+fetch_as3_declare() {
+    curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
+}
+
+# ------------------------------
+# 3️⃣ Corrélation iControl / AS3 par nom de pool
+# ------------------------------
+correlate_pool_as3() {
+    > "${TMP_MEMS}_correlated"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        POOL=$(echo $line | awk '{print $1}')
+        MEMBER=$(echo $line | awk '{print $2}')
+
+        AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p)' "$TMP_AS3" 2>/dev/null)
+        if [ -n "$AS3_EXISTS" ]; then
+            echo "$POOL $MEMBER [AS3]" >> "${TMP_MEMS}_correlated"
+        else
+            echo "$POOL $MEMBER [NO_AS3]" >> "${TMP_MEMS}_correlated"
+        fi
+    done < "$TMP_MEMS"
+}
+
+# ------------------------------
+# 4️⃣ Test TCP/TLS/mTLS
 # ------------------------------
 check_target() {
-    local VSNAME="$1"
+    local POOL="$1"
     local HOST="$2"
     local PORT="$3"
 
@@ -125,8 +86,8 @@ check_target() {
     local TCP_STATUS="KO"
     local TLS_STATUS="KO"
     local MTLS_STATUS="N/A"
-    local IP
-    IP=$(getent ahosts "$HOST" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+
+    IP=$(getent ahosts "${HOST}" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
     [ -z "$IP" ] && IP="(résolution échouée)"
 
     # TCP
@@ -169,10 +130,10 @@ check_target() {
     fi
 
     if [ "$VERBOSE" -eq 0 ]; then
-        echo "${PREFIX}VS=${VSNAME} Target=${HOST}:${PORT} (${IP}) TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
+        echo "${PREFIX}Pool=${POOL} Target=${HOST}:${PORT} (${IP}) TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
     else
         echo
-        echo "=== Test TLS -> VS=${VSNAME} Target=${HOST}:${PORT} (${IP}) ==="
+        echo "=== Test TLS -> Pool=${POOL} Target=${HOST}:${PORT} (${IP}) ==="
         echo "${PREFIX}TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
         [ -n "$CLIENT_CERT" ] && echo "Cert client fourni: $CLIENT_CERT"
         [ -n "$CA_CERT" ] && echo "CA: $CA_CERT"
@@ -181,7 +142,7 @@ check_target() {
 }
 
 # ------------------------------
-# Argument parsing
+# 5️⃣ Argument parsing
 # ------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -197,22 +158,26 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------
-# Execution
+# 6️⃣ Execution
 # ------------------------------
 if [ "$BIGIP_MODE" -eq 1 ]; then
-    fetch_bigip_local_vs
+    fetch_pools_icontrol
+    fetch_as3_declare
+    correlate_pool_as3
+    FILE="${TMP_MEMS}_correlated"
 fi
 
 if [ -n "$FILE" ]; then
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        VSNAME="${line%% *}"
-        HOSTPORT="${line#* }"
+        POOL=$(echo $line | awk '{print $1}')
+        HOSTPORT=$(echo $line | awk '{print $2}')
         HOST="${HOSTPORT%:*}"
         PORT="${HOSTPORT##*:}"
-        check_target "$VSNAME" "$HOST" "$PORT"
+        check_target "$POOL" "$HOST" "$PORT"
         sleep_ms "$SLEEP_MS"
     done < "$FILE"
 fi
 
 [ -n "$TMP_MEMS" ] && rm -f "$TMP_MEMS"
+[ -n "$TMP_AS3" ] && rm -f "$TMP_AS3"
