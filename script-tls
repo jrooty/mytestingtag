@@ -48,16 +48,15 @@ fetch_bigip_local_vs() {
                 [ "$VS_TYPE" = "fastl4" ] && continue
             fi
 
-            # Vérifier SSL C3D si mode filtré
-            SSL_C3D_OK=0
+            # Vérifier SSL C3D si mode filtré seulement
             if [ "$LOCAL_FULL" -eq 0 ] && [ "$PROFILES_LINK" != "null" ]; then
                 PROFILES_JSON=$(mktemp)
                 curl -sS -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
-                if jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
-                    SSL_C3D_OK=1
+                if ! jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
+                    rm -f "$PROFILES_JSON"
+                    continue
                 fi
                 rm -f "$PROFILES_JSON"
-                [ "$SSL_C3D_OK" -eq 0 ] && [ "$PROFILES_LINK" != "null" ] && continue
             fi
 
             # Récupérer pool members si pool défini
