@@ -12,17 +12,23 @@ jq -r '.items? // [] | .[] | .name' "$TMP_POOLS" > pools_list.txt
 # 3️⃣ Récupérer la déclaration AS3
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
 
-# 4️⃣ Extraire toutes les clés dont la valeur contient "class": "Pool"
+# 4️⃣ Extraire toutes les clés de type "Pool" (avec leur nom complet tenant/app/pool)
 jq -r '
-  paths | select(.[-1] == "class") as $p
-  | getpath($p[:-1]) as $obj
-  | select(getpath($p) == "Pool")
-  | $p[-2]
-' "$TMP_AS3" | sort -u > as3_pools.txt
+  def walk(f):
+    . as $in | if type == "object" then
+      reduce keys_unsorted[] as $key ({}; . + { ($key): ($in[$key] | walk(f)) }) | f
+    elif type == "array" then map(walk(f)) | f
+    else f
+    end;
+
+  walk(if (type=="object" and .class?=="Pool") then
+    (path(.) | map(tostring) | join("/"))
+  else empty end)
+' "$TMP_AS3" | grep -v '^\s*$' | sort -u > as3_pools.txt
 
 echo "Matching pools iControl → AS3 :"
 while read -r POOL_NAME; do
-    if grep -qx "$POOL_NAME" as3_pools.txt; then
+    if grep -q "/${POOL_NAME}$" as3_pools.txt; then
         echo "Pool=${POOL_NAME} AS3_FOUND=OK"
     else
         echo "Pool=${POOL_NAME} AS3_FOUND=KO"
