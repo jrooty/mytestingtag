@@ -1,46 +1,49 @@
 #!/bin/bash
 set -e
-TMP_POOLS=$(mktemp)
+
+F5_USER="admin:"
+F5_URL="http://localhost:8100"
 TMP_AS3=$(mktemp)
+TMP_POOLS=$(mktemp)
 
-# 1️⃣ Récupérer tous les pools via iControl REST
-curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool -o "$TMP_POOLS"
+# 1️⃣ Récupère les pools iControl
+echo "[INFO] Récupération des pools via iControl..."
+curl -sS --insecure -u "$F5_USER" "$F5_URL/mgmt/tm/ltm/pool" | jq -r '.items[].name' > "$TMP_POOLS"
 
-# 2️⃣ Extraire les noms des pools iControl
-jq -r '.items? // [] | .[] | .name' "$TMP_POOLS" > pools_list.txt
+# 2️⃣ Récupère la déclaration AS3 complète
+echo "[INFO] Récupération de la déclaration AS3..."
+curl -sS --insecure -u "$F5_USER" "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"
 
-# 3️⃣ Récupérer la déclaration AS3
-curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
-
-# 4️⃣ Extraire toutes les clés de type "Pool" (avec leur nom complet tenant/app/pool)
-jq -r '
-  def walk(f):
-    . as $in | if type == "object" then
-      reduce keys_unsorted[] as $key ({}; . + { ($key): ($in[$key] | walk(f)) }) | f
-    elif type == "array" then map(walk(f)) | f
-    else f
-    end;
-
-  walk(if (type=="object" and .class?=="Pool") then
-    (path(.) | map(tostring) | join("/"))
-  else empty end)
-' "$TMP_AS3" | grep -v '^\s*$' | sort -u > as3_pools.txt
-
-# 💡 DEBUG : afficher ce que jq a trouvé
+# 3️⃣ Corrélation entre pool iControl et AS3
 echo
-echo "=== DEBUG: Liste des pools trouvés dans la déclaration AS3 ==="
-cat as3_pools.txt
-echo "=============================================================="
-echo
+echo "=== Corrélation des pools ==="
+while read -r pool; do
+    # Recherche dans l’arborescence AS3 si le nom du pool est une clé
+    match=$(jq -r --arg POOL "$pool" '
+        paths
+        | select(.[-1] == $POOL)
+        | map(tostring)
+        | join(".")
+    ' "$TMP_AS3")
 
-# 5️⃣ Matching iControl → AS3
-echo "Matching pools iControl → AS3 :"
-while read -r POOL_NAME; do
-    if grep -q "/${POOL_NAME}$" as3_pools.txt; then
-        echo "Pool=${POOL_NAME} AS3_FOUND=OK"
+    if [ -n "$match" ]; then
+        # Vérifie si ce pool est référencé dans un VS
+        vs_name=$(jq -r --arg POOL "$pool" '
+            .. | objects | select(has("class"))
+            | select(.class | test("Service_"; "i"))
+            | select(.pool == $POOL)
+            | .name // empty
+        ' "$TMP_AS3")
+
+        if [ -n "$vs_name" ]; then
+            echo "✅ Pool '$pool' trouvé dans AS3 → associé à VS '$vs_name'"
+        else
+            echo "⚠️  Pool '$pool' trouvé dans AS3 (aucun VS lié)"
+        fi
     else
-        echo "Pool=${POOL_NAME} AS3_FOUND=KO"
+        echo "❌ Pool '$pool' non trouvé dans la déclaration AS3"
     fi
-done < pools_list.txt
+done < "$TMP_POOLS"
 
-rm -f "$TMP_POOLS" "$TMP_AS3"
+# Nettoyage
+rm -f "$TMP_AS3" "$TMP_POOLS"
