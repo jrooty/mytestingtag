@@ -9,11 +9,11 @@ VERBOSE=0
 CLIENT_CERT=""
 CLIENT_KEY=""
 CA_CERT=""
-FILE=""
 BIGIP_MODE=0
 LOCAL_FULL=0
-TMP_MEMS=$(mktemp)
+TMP_JSON=$(mktemp)
 TMP_AS3=$(mktemp)
+TMP_OUTPUT=$(mktemp)
 
 sleep_ms() { sleep "$(awk "BEGIN {printf \"%.3f\", $1/1000}")"; }
 
@@ -28,128 +28,7 @@ colorize_status() {
 }
 
 # ------------------------------
-# 1️⃣ Récupérer pools et pool members via iControl REST
-# ------------------------------
-fetch_pools_icontrol() {
-    TMP_JSON=$(mktemp)
-    curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_JSON"
-
-    > "$TMP_MEMS"
-    mapfile -t POOLS < <(jq -r '.items? // [] | .[].name' "$TMP_JSON")
-    for pool in "${POOLS[@]}"; do
-        POOL_JSON=$(mktemp)
-        curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/${pool}/members" -o "$POOL_JSON"
-        mapfile -t MEMBERS < <(jq -r '.items? // [] | .[] | "\(.name)"' "$POOL_JSON")
-        for mem in "${MEMBERS[@]}"; do
-            echo "$pool $mem" >> "$TMP_MEMS"
-        done
-        rm -f "$POOL_JSON"
-    done
-    rm -f "$TMP_JSON"
-}
-
-# ------------------------------
-# 2️⃣ Récupérer déclaration AS3 via HTTP / admin:
-# ------------------------------
-fetch_as3_declare() {
-    curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
-}
-
-# ------------------------------
-# 3️⃣ Corrélation iControl / AS3 par nom de pool
-# ------------------------------
-correlate_pool_as3() {
-    > "${TMP_MEMS}_correlated"
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        POOL=$(echo $line | awk '{print $1}')
-        MEMBER=$(echo $line | awk '{print $2}')
-
-        if [ "$LOCAL_FULL" -eq 1 ]; then
-            # Récupérer tous les pools, aucun filtre
-            AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
-        else
-            # Filtre par défaut : exclure fastl4 et pools sans C3D
-            AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
-        fi
-
-        if [ -n "$AS3_EXISTS" ]; then
-            echo "$POOL $MEMBER [AS3]" >> "${TMP_MEMS}_correlated"
-        else
-            echo "$POOL $MEMBER [NO_AS3]" >> "${TMP_MEMS}_correlated"
-        fi
-    done < "$TMP_MEMS"
-}
-
-# ------------------------------
-# 4️⃣ Test TCP/TLS/mTLS
-# ------------------------------
-check_target() {
-    local POOL="$1"
-    local HOST="$2"
-    local PORT="$3"
-
-    local TMP_OUT=$(mktemp)
-    local TCP_STATUS="KO"
-    local TLS_STATUS="KO"
-    local MTLS_STATUS="N/A"
-
-    IP=$(getent ahosts "${HOST}" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
-    [ -z "$IP" ] && IP="(résolution échouée)"
-
-    # TCP
-    if timeout $TCP_TIMEOUT bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null; then TCP_STATUS="OK"; fi
-
-    # TLS + mTLS
-    if [ "$TCP_STATUS" = "OK" ]; then
-        CMD=(timeout "$OPENSSL_TIMEOUT" openssl s_client -connect "$HOST:$PORT" -servername "$HOST" -showcerts)
-        [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ] && CMD+=(-cert "$CLIENT_CERT" -key "$CLIENT_KEY")
-        [ -n "$CA_CERT" ] && CMD+=(-CAfile "$CA_CERT")
-        "${CMD[@]}" </dev/null >"$TMP_OUT" 2>&1 || true
-
-        if grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"; then TLS_STATUS="OK"; else TLS_STATUS="KO"; fi
-
-        if grep -q "Acceptable client certificate CA names" "$TMP_OUT" || grep -q "SSL alert number 40" "$TMP_OUT"; then
-            if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
-                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
-            else
-                MTLS_STATUS="REQ"
-            fi
-        else
-            if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
-                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
-            else
-                MTLS_STATUS="NO"
-            fi
-        fi
-    else
-        TLS_STATUS="KO"
-        MTLS_STATUS="N/A"
-    fi
-
-    PREFIX=""
-    if [ "$TCP_STATUS" != "OK" ] || [ "$TLS_STATUS" != "OK" ] || [ "$MTLS_STATUS" = "FAIL" ]; then
-        PREFIX="[ERR] "
-    elif [ "$MTLS_STATUS" = "REQ" ]; then
-        PREFIX="[WARN] "
-    else
-        PREFIX="[OK] "
-    fi
-
-    if [ "$VERBOSE" -eq 0 ]; then
-        echo "${PREFIX}Pool=${POOL} Target=${HOST}:${PORT} (${IP}) TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
-    else
-        echo
-        echo "=== Test TLS -> Pool=${POOL} Target=${HOST}:${PORT} (${IP}) ==="
-        echo "${PREFIX}TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
-        [ -n "$CLIENT_CERT" ] && echo "Cert client fourni: $CLIENT_CERT"
-        [ -n "$CA_CERT" ] && echo "CA: $CA_CERT"
-    fi
-    rm -f "$TMP_OUT"
-}
-
-# ------------------------------
-# 5️⃣ Argument parsing
+# Argument parsing
 # ------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -165,26 +44,122 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------
-# 6️⃣ Execution
+# 1️⃣ Récupérer tous les VS
 # ------------------------------
-if [ "$BIGIP_MODE" -eq 1 ]; then
-    fetch_pools_icontrol
-    fetch_as3_declare
-    correlate_pool_as3
-    FILE="${TMP_MEMS}_correlated"
-fi
+curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/virtual -o "$TMP_JSON"
 
-if [ -n "$FILE" ]; then
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        POOL=$(echo $line | awk '{print $1}')
-        HOSTPORT=$(echo $line | awk '{print $2}')
-        HOST="${HOSTPORT%:*}"
-        PORT="${HOSTPORT##*:}"
-        check_target "$POOL" "$HOST" "$PORT"
-        sleep_ms "$SLEEP_MS"
-    done < "$FILE"
-fi
+mapfile -t VS_LIST < <(jq -r '.items? // [] | .[].name' "$TMP_JSON")
 
-[ -n "$TMP_MEMS" ] && rm -f "$TMP_MEMS"
-[ -n "$TMP_AS3" ] && rm -f "$TMP_AS3"
+# ------------------------------
+# 2️⃣ Récupérer déclaration AS3
+# ------------------------------
+curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
+
+# ------------------------------
+# 3️⃣ Parcourir VS
+# ------------------------------
+for VS in "${VS_LIST[@]}"; do
+    VS_JSON=$(mktemp)
+    curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/virtual/${VS}" -o "$VS_JSON"
+
+    # Type du VS et pool associé
+    VS_TYPE=$(jq -r '.ipProtocol // ""' "$VS_JSON")
+    POOL_NAME=$(jq -r '.pool // empty' "$VS_JSON")
+    
+    # Skip si local et fastl4
+    if [ "$LOCAL_FULL" -eq 0 ] && [[ "$VS_TYPE" == "fastl4" ]]; then
+        rm -f "$VS_JSON"
+        continue
+    fi
+
+    # Vérifier C3D via AS3 si applicable
+    C3D_OK=0
+    if [ "$LOCAL_FULL" -eq 0 ] && [ -n "$POOL_NAME" ]; then
+        AS3_POOL=$(jq -r --arg p "$POOL_NAME" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3")
+        if [ -n "$AS3_POOL" ]; then
+            C3D_OK=1
+        fi
+        # Skip si C3D pas actif
+        if [ "$C3D_OK" -eq 0 ]; then
+            rm -f "$VS_JSON"
+            continue
+        fi
+    fi
+
+    # ------------------------------
+    # Récupérer pool members
+    # ------------------------------
+    if [ -n "$POOL_NAME" ]; then
+        POOL_JSON=$(mktemp)
+        curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/${POOL_NAME}/members" -o "$POOL_JSON"
+        MEMBERS=$(jq -r '.items? // [] | .[].name' "$POOL_JSON")
+        
+        for MEMBER in $MEMBERS; do
+            # ------------------------------
+            # Test TCP/TLS/mTLS
+            # ------------------------------
+            HOST="${MEMBER%:*}"
+            PORT="${MEMBER##*:}"
+            TMP_OUT=$(mktemp)
+            TCP_STATUS="KO"
+            TLS_STATUS="KO"
+            MTLS_STATUS="N/A"
+
+            IP=$(getent ahosts "$HOST" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+            [ -z "$IP" ] && IP="(résolution échouée)"
+
+            if timeout $TCP_TIMEOUT bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null; then TCP_STATUS="OK"; fi
+
+            if [ "$TCP_STATUS" = "OK" ]; then
+                CMD=(timeout "$OPENSSL_TIMEOUT" openssl s_client -connect "$HOST:$PORT" -servername "$HOST" -showcerts)
+                [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ] && CMD+=(-cert "$CLIENT_CERT" -key "$CLIENT_KEY")
+                [ -n "$CA_CERT" ] && CMD+=(-CAfile "$CA_CERT")
+                "${CMD[@]}" </dev/null >"$TMP_OUT" 2>&1 || true
+
+                if grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"; then TLS_STATUS="OK"; else TLS_STATUS="KO"; fi
+
+                if grep -q "Acceptable client certificate CA names" "$TMP_OUT" || grep -q "SSL alert number 40" "$TMP_OUT"; then
+                    if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
+                        if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
+                    else
+                        MTLS_STATUS="REQ"
+                    fi
+                else
+                    if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
+                        if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
+                    else
+                        MTLS_STATUS="NO"
+                    fi
+                fi
+            else
+                TLS_STATUS="KO"
+                MTLS_STATUS="N/A"
+            fi
+
+            PREFIX=""
+            if [ "$TCP_STATUS" != "OK" ] || [ "$TLS_STATUS" != "OK" ] || [ "$MTLS_STATUS" = "FAIL" ]; then
+                PREFIX="[ERR] "
+            elif [ "$MTLS_STATUS" = "REQ" ]; then
+                PREFIX="[WARN] "
+            else
+                PREFIX="[OK] "
+            fi
+
+            if [ "$VERBOSE" -eq 0 ]; then
+                echo "${PREFIX}VS=${VS} Pool=${POOL_NAME} Member=${MEMBER} TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
+            else
+                echo
+                echo "=== Test TLS -> VS=${VS} Pool=${POOL_NAME} Member=${MEMBER} (${IP}) ==="
+                echo "${PREFIX}TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
+                [ -n "$CLIENT_CERT" ] && echo "Cert client fourni: $CLIENT_CERT"
+                [ -n "$CA_CERT" ] && echo "CA: $CA_CERT"
+            fi
+            rm -f "$TMP_OUT"
+            sleep_ms "$SLEEP_MS"
+        done
+        rm -f "$POOL_JSON"
+    fi
+    rm -f "$VS_JSON"
+done
+
+rm -f "$TMP_JSON" "$TMP_AS3"
