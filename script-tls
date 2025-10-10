@@ -2,41 +2,69 @@
 set -euo pipefail
 
 F5_URL="http://localhost:8100"
-AUTH="admin:"        # ← identifiant sans mot de passe
-TMP_AS3=$(mktemp)
+AUTH="admin:"           # identifiant, mot de passe vide
+TMP_AS3="$(mktemp)"
 trap 'rm -f "$TMP_AS3"' EXIT
 
-echo "[INFO] Récupération de la déclaration AS3..."
+echo "[INFO] GET $F5_URL/mgmt/shared/appsvcs/declare"
 if ! curl -sS --fail --insecure -u "$AUTH" -H 'Accept: application/json' \
   "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"; then
-  echo "[ERR] Impossible de récupérer /mgmt/shared/appsvcs/declare sur $F5_URL"
+  echo "[ERR] Impossible de récupérer la déclaration AS3." >&2
   exit 1
 fi
 
-# Vérifie JSON valide
+# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_AS3"; then
-  echo "[ERR] Réponse non valide JSON"
-  head -c 500 "$TMP_AS3"
+  echo "[ERR] Réponse non-JSON. Extrait :" >&2
+  head -c 500 "$TMP_AS3" >&2
   exit 2
 fi
 
-echo
-echo "=== Liste des VS dans la déclaration AS3 ==="
+# Parcours sûr des Tenants -> Applications -> Services (HTTP/HTTPS/L4)
 jq -r '
-  ( .declaration // . ) as $root
-  | $root
-  | to_entries[]
-  | select(.value | type=="object")
-  | .key as $tenant
-  | .value
-  | to_entries[]
-  | select(.value | type=="object" and (.value.class?=="Application"))
-  | .key as $app
-  | .value
-  | to_entries[]
-  | select(.value | type=="object" and
-           (.value.class?=="Service_HTTP" or .value.class?=="Service_HTTPS" or .value.class?=="Service_L4"))
-  | .key as $vs
-  | .value as $svc
-  | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
+  # Choisir la racine: .declaration si présent, sinon la valeur brute
+  (.declaration // .) as $root
+  | ( $root | type ) as $t
+  | if $t == "object" then
+      # Cas racine = objet de tenants
+      $root
+      | to_entries[]                               # tenants
+      | select(.value | type=="object")
+      | .key as $tenant
+      | .value
+      | to_entries[]                               # applications
+      | select(.value | type=="object" and (.value.class?=="Application"))
+      | .key as $app
+      | .value
+      | to_entries[]                               # objets applicatifs
+      | select(.value | type=="object"
+               and ((.value.class?=="Service_HTTP")
+                 or (.value.class?=="Service_HTTPS")
+                 or (.value.class?=="Service_L4")))
+      | .key   as $vs
+      | .value as $svc
+      | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
+    elif $t == "array" then
+      # Cas racine = tableau de tenants
+      $root[]
+      | select(type=="object")
+      | to_entries[]                               # tenants
+      | select(.value | type=="object")
+      | .key as $tenant
+      | .value
+      | to_entries[]                               # applications
+      | select(.value | type=="object" and (.value.class?=="Application"))
+      | .key as $app
+      | .value
+      | to_entries[]                               # objets applicatifs
+      | select(.value | type=="object"
+               and ((.value.class?=="Service_HTTP")
+                 or (.value.class?=="Service_HTTPS")
+                 or (.value.class?=="Service_L4")))
+      | .key   as $vs
+      | .value as $svc
+      | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
+    else
+      empty
+    end
 ' "$TMP_AS3"
