@@ -1,10 +1,6 @@
 #!/bin/bash
 set -o pipefail
 
-# test_tls_bigip_local_mtls.sh
-# Test TLS/TCP/mTLS avec option --local pour BIG-IP localhost:8100 (auth admin:)
-# Retourne pool name + host:port + TCP/TLS/mTLS status + ERR/WARN/OK
-
 OPENSSL_TIMEOUT=12
 TCP_TIMEOUT=5
 SLEEP_MS=200
@@ -14,8 +10,6 @@ CLIENT_CERT=""
 CLIENT_KEY=""
 CA_CERT=""
 FILE=""
-TARGET=""
-DEFAULT_PORT=""
 BIGIP_MODE=0
 TMP_MEMS=""
 
@@ -31,44 +25,49 @@ colorize_status() {
     esac
 }
 
-fetch_bigip_local() {
+fetch_bigip_local_vs() {
     TMP_JSON=$(mktemp)
-    curl -sS -k -u admin: https://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
-
-    MEMBERS=()
-    if command -v jq >/dev/null 2>&1; then
-        mapfile -t MEMBERS < <(jq -r '.items[] | .name as $poolname | .membersReference.items[]?.name? | "\($poolname) \(. )"' "$TMP_JSON")
-    else
-        mapfile -t MEMBERS < <(python3 - <<PY - "$TMP_JSON"
-import sys, json
-fn=sys.argv[1]
-with open(fn) as f:
-    j=json.load(f)
-for pool in j.get("items",[]):
-    pname=pool.get("name")
-    for m in pool.get("membersReference",{}).get("items",[]):
-        mem=m.get("name")
-        if pname and mem:
-            print(f"{pname} {mem}")
-PY
-"$TMP_JSON")
-    fi
-    rm -f "$TMP_JSON"
+    curl -sS -k -u admin: https://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
 
     TMP_MEMS=$(mktemp)
-    for line in "${MEMBERS[@]}"; do
-        POOLNAME="${line%% *}"
-        MEMBER="${line#* }"
-        HOSTPORT="${MEMBER##*/}"
-        if [[ "$HOSTPORT" == *:* ]]; then
-            echo "$POOLNAME $HOSTPORT" >> "$TMP_MEMS"
-        fi
-    done
+    if command -v jq >/dev/null 2>&1; then
+        # Parcours tous les VS
+        mapfile -t VS_LIST < <(jq -r '.items[] | select(.type!="fastl4") | "\(.name) \(.destination) \(.pool) \(.profilesReference.link)"' "$TMP_JSON")
+        for vs in "${VS_LIST[@]}"; do
+            VS_NAME="${vs%% *}"
+            rest="${vs#* }"
+            DEST="${rest%% *}"
+            rest2="${rest#* }"
+            POOL="${rest2%% *}"
+            PROFILES_LINK="${rest2#* }"
+
+            # Vérifier si VS a profile serverssl avec C3D activé
+            SSL_C3D_OK=0
+            PROFILES_JSON=$(mktemp)
+            curl -sS -k -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
+            if jq -e '.items[] | select(.context=="clientside" or .context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
+                SSL_C3D_OK=1
+            fi
+            rm -f "$PROFILES_JSON"
+
+            # Si profile SSL avec C3D OK ou VS non-SSL, on récupère les members
+            if [[ "$SSL_C3D_OK" -eq 1 || "$POOL" != "null" ]]; then
+                # Extraire IP:PORT du pool members
+                POOL_JSON=$(mktemp)
+                curl -sS -k -u admin: "https://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
+                mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
+                rm -f "$POOL_JSON"
+                for mem in "${MEMBERS[@]}"; do
+                    echo "$VS_NAME $mem" >> "$TMP_MEMS"
+                done
+            fi
+        done
+    fi
     FILE="$TMP_MEMS"
 }
 
 check_target() {
-    local POOLNAME="$1"
+    local VSNAME="$1"
     local HOST="$2"
     local PORT="$3"
 
@@ -90,30 +89,17 @@ check_target() {
         [ -n "$CA_CERT" ] && CMD+=(-CAfile "$CA_CERT")
         "${CMD[@]}" </dev/null >"$TMP_OUT" 2>&1 || true
 
-        if grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"; then
-            TLS_STATUS="OK"
-        else
-            TLS_STATUS="KO"
-        fi
+        if grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"; then TLS_STATUS="OK"; else TLS_STATUS="KO"; fi
 
-        # mTLS detection
         if grep -q "Acceptable client certificate CA names" "$TMP_OUT" || grep -q "SSL alert number 40" "$TMP_OUT"; then
             if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
-                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then
-                    MTLS_STATUS="OK"
-                else
-                    MTLS_STATUS="FAIL"
-                fi
+                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
             else
                 MTLS_STATUS="REQ"
             fi
         else
             if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
-                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then
-                    MTLS_STATUS="OK"
-                else
-                    MTLS_STATUS="FAIL"
-                fi
+                if grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then MTLS_STATUS="OK"; else MTLS_STATUS="FAIL"; fi
             else
                 MTLS_STATUS="NO"
             fi
@@ -133,17 +119,13 @@ check_target() {
     fi
 
     if [ "$VERBOSE" -eq 0 ]; then
-        echo "${PREFIX}Pool=${POOLNAME} Target=${HOST}:${PORT} (${IP}) TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
+        echo "${PREFIX}VS=${VSNAME} Target=${HOST}:${PORT} (${IP}) TCP=$(colorize_status $TCP_STATUS) TLS=$(colorize_status $TLS_STATUS) mTLS=$(colorize_status $MTLS_STATUS)"
     else
         echo
-        echo "=== Test TLS -> Pool=${POOLNAME} Target=${HOST}:${PORT} (${IP}) ==="
+        echo "=== Test TLS -> VS=${VSNAME} Target=${HOST}:${PORT} (${IP}) ==="
         echo "${PREFIX}TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
         [ -n "$CLIENT_CERT" ] && echo "Cert client fourni: $CLIENT_CERT"
         [ -n "$CA_CERT" ] && echo "CA: $CA_CERT"
-        echo "=== Certificat serveur (sommaire) ==="
-        awk 'BEGIN{cert=0}/-----BEGIN CERTIFICATE-----/{cert=1;print;next}/-----END CERTIFICATE-----/{if(cert){print;exit}}cert{print}' "$TMP_OUT" >"${TMP_OUT}.pem" 2>/dev/null
-        [ -s "${TMP_OUT}.pem" ] && openssl x509 -in "${TMP_OUT}.pem" -noout -subject -issuer -dates || echo "(aucun certificat)"
-        rm -f "${TMP_OUT}.pem"
     fi
     rm -f "$TMP_OUT"
 }
@@ -167,17 +149,17 @@ done
 # Execution
 # ------------------------------
 if [ "$BIGIP_MODE" -eq 1 ]; then
-    fetch_bigip_local
+    fetch_bigip_local_vs
 fi
 
 if [ -n "$FILE" ]; then
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        POOLNAME="${line%% *}"
+        VSNAME="${line%% *}"
         HOSTPORT="${line#* }"
         HOST="${HOSTPORT%:*}"
         PORT="${HOSTPORT##*:}"
-        check_target "$POOLNAME" "$HOST" "$PORT"
+        check_target "$VSNAME" "$HOST" "$PORT"
         sleep_ms "$SLEEP_MS"
     done < "$FILE"
 fi
