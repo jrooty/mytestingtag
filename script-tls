@@ -1,18 +1,24 @@
 #!/bin/bash
-# Liste tous les VS (toutes partitions) et indique fastl4 / https / http
-# Détection basée sur des noms standardisés de profil :
-#  - fastl4 : présence d'un profil contenant "PrfFastl4"
-#  - https  : présence simultanée de "PrfCSSL" et "PrfHTTP"
-#  - http   : présence de "PrfHTTP" sans "PrfCSSL"
-# Sinon : "other"
+# Classement des VS BIG-IP selon profils nommés :
+#  - fastl4 : profil contenant "PrfFastl4"
+#  - https  : profils contenant "PrfCSSL" ET "PrfHTTP"
+#  - http   : profil contenant "PrfHTTP" mais PAS "PrfCSSL"
+# Sinon : other
+# Parcourt toutes les partitions (recursive). Ajoute --debug pour afficher les profils vus.
 
 set -eo pipefail
 
-# Récupère toutes les virtuals en une ligne (toutes partitions)
+DEBUG=0
+[[ "${1:-}" == "--debug" ]] && DEBUG=1
+
+# En-tête
+printf "%-28s %-40s %-24s %-8s\n" "PARTITION" "VS_NAME" "DESTINATION" "TYPE"
+
+# Tous les VS (une ligne par VS, toutes partitions)
 tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null | while IFS= read -r line; do
   # Chemin VS (/Partition/Name)
   vs_path=$(awk '{for (i=1;i<=NF;i++) if ($i=="virtual") {print $(i+1); break}}' <<<"$line")
-  [ -z "$vs_path" ] && continue
+  [[ -z "$vs_path" ]] && continue
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
@@ -20,33 +26,31 @@ tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null | while IFS= 
   dest=$(awk '{for (i=1;i<=NF;i++) if ($i=="destination") {print $(i+1); break}}' <<<"$line")
   [[ "$dest" == */*:* ]] && dest="${dest##*/}"
 
-  # Extraire le bloc profiles { ... } sur la one-line
-  prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$line" || true)
+  # Récupère uniquement la section profiles de CE VS (fiable, quel que soit le format “one-line”)
+  profiles_text=$(tmsh -q -c "list ltm virtual ${vs_path} profiles" 2>/dev/null || true)
 
-  # Fallback : si le bloc n'est pas présent, on récupère les profils pour ce VS
-  if [ -z "$prof_block" ]; then
-    vs_prof_line=$(tmsh -q -c "list ltm virtual ${vs_path} profiles one-line" 2>/dev/null || true)
-    prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$vs_prof_line" || true)
-  fi
-
-  # Normaliser en minuscules pour un match tolérant (PrfHTTP/prfHTTP…)
-  prof_lc=$(echo "$prof_block" | tr '[:upper:]' '[:lower:]')
-
-  # Flags selon tes patterns
+  # Détection par motifs (insensible à la casse)
   has_fastl4=0; has_http=0; has_cssl=0
-  [[ "$prof_lc" == *prffastl4* ]] && has_fastl4=1
-  [[ "$prof_lc" == *prfhttp*   ]] && has_http=1
-  [[ "$prof_lc" == *prfcssl*   ]] && has_cssl=1
+  grep -qi 'PrfFastl4' <<<"$profiles_text" && has_fastl4=1
+  grep -qi 'PrfHTTP'   <<<"$profiles_text" && has_http=1
+  grep -qi 'PrfCSSL'   <<<"$profiles_text" && has_cssl=1
 
-  # Classement par priorité
+  # Priorité : fastl4 > https > http > other
   vs_type="other"
-  if [ $has_fastl4 -eq 1 ]; then
+  if (( has_fastl4 )); then
     vs_type="fastl4"
-  elif [ $has_http -eq 1 ] && [ $has_cssl -eq 1 ]; then
+  elif (( has_http && has_cssl )); then
     vs_type="https"
-  elif [ $has_http -eq 1 ] && [ $has_cssl -eq 0 ]; then
+  elif (( has_http && !has_cssl )); then
     vs_type="http"
   fi
 
   printf "%-28s %-40s %-24s %-8s\n" "$part" "$vs_name" "${dest:-"-"}" "$vs_type"
+
+  if (( DEBUG )); then
+    echo "  -> VS: $vs_path"
+    echo "  -> Profiles vus:"
+    echo "$profiles_text" | sed 's/^/     /'
+    echo "  -> Flags: fastl4=$has_fastl4 cssl=$has_cssl http=$has_http => type=$vs_type"
+  fi
 done
