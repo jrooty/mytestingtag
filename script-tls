@@ -4,7 +4,9 @@ TMP_POOLS=$(mktemp)
 TMP_AS3=$(mktemp)
 TMP_MEMBERS=$(mktemp)
 
-# 1️⃣ Récupérer tous les pools
+# ------------------------------
+# 1️⃣ Récupérer tous les pools via iControl REST
+# ------------------------------
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_POOLS"
 
 # 2️⃣ Lister pools et leurs membres
@@ -26,17 +28,21 @@ done < pools_list.txt > pool_members.txt
 echo "Pools et leurs membres récupérés via iControl REST :"
 cat pool_members.txt
 
+# ------------------------------
 # 3️⃣ Récupérer déclaration AS3
+# ------------------------------
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
 
+# ------------------------------
 # 4️⃣ Corrélation Pool → VS via AS3 (dans les LTP)
+# ------------------------------
 echo
 echo "Corrélation Pool → VS via AS3 (LTP) :"
 while read -r line; do
     POOL_NAME=$(echo "$line" | awk '{print $1}')
     MEMBER_NAME=$(echo "$line" | awk '{print $2}')
     
-    # Cherche pool dans LTP et remonte VS
+    # Cherche pool dans LTP et remonte VS (Service_HTTPS ou Service_L4)
     VS_NAME=$(jq -r --arg pool "$POOL_NAME" '
         .. | objects
         | select(.class=="Pool" and .name==$pool)
