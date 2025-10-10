@@ -35,13 +35,13 @@ fetch_pools_icontrol() {
     curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_JSON"
 
     > "$TMP_MEMS"
-    mapfile -t POOLS < <(jq -r '.items[].name' "$TMP_JSON")
+    mapfile -t POOLS < <(jq -r '.items? // [] | .[].name' "$TMP_JSON")
     for pool in "${POOLS[@]}"; do
         POOL_JSON=$(mktemp)
         curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/${pool}/members" -o "$POOL_JSON"
-        mapfile -t MEMBERS < <(jq -r ".items[] | \"${pool} \(.name)\"" "$POOL_JSON")
+        mapfile -t MEMBERS < <(jq -r '.items? // [] | .[] | "\(.name)"' "$POOL_JSON")
         for mem in "${MEMBERS[@]}"; do
-            echo "$mem" >> "$TMP_MEMS"
+            echo "$pool $mem" >> "$TMP_MEMS"
         done
         rm -f "$POOL_JSON"
     done
@@ -65,7 +65,7 @@ correlate_pool_as3() {
         POOL=$(echo $line | awk '{print $1}')
         MEMBER=$(echo $line | awk '{print $2}')
 
-        AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p)' "$TMP_AS3" 2>/dev/null)
+        AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
         if [ -n "$AS3_EXISTS" ]; then
             echo "$POOL $MEMBER [AS3]" >> "${TMP_MEMS}_correlated"
         else
