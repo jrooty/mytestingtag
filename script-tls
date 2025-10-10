@@ -2,26 +2,59 @@
 set -euo pipefail
 
 F5_URL="http://localhost:8100"
-TMP_AS3=$(mktemp)
+DEBUG=0
 
-# 1️⃣ Récupération de la déclaration AS3 locale (pas d'authent)
-curl -sS --insecure "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"
+if [[ "${1:-}" == "--debug" ]]; then DEBUG=1; fi
 
-# 2️⃣ Parcours du JSON pour lister les VS
+TMP_AS3="$(mktemp)"
+trap 'rm -f "$TMP_AS3"' EXIT
+
+# 1) Récupération de la déclaration AS3 (HTTP 8100, sans mot de passe)
+#    --fail pour remonter code HTTP≠2xx, Accept JSON pour éviter une page HTML
+if ! curl -sS --fail --insecure -H 'Accept: application/json' \
+  "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"; then
+  echo "[ERR] Impossible de récupérer /mgmt/shared/appsvcs/declare sur $F5_URL"
+  exit 1
+fi
+
+# 2) Vérifier que c'est bien du JSON
+if ! jq -e . >/dev/null 2>&1 <"$TMP_AS3"; then
+  echo "[ERR] La réponse n'est pas du JSON valide."
+  if [[ $DEBUG -eq 1 ]]; then
+    echo "--- Début de la réponse brute ---"
+    head -c 800 "$TMP_AS3" || true
+    echo
+    echo "--- Fin de la réponse brute ---"
+  fi
+  exit 2
+fi
+
+# 3) Extraire la racine de la déclaration (certaines versions enveloppent dans .declaration)
+#    Puis parcourir Tenants -> Applications (class=="Application") -> Services (HTTP/HTTPS/L4)
 jq -r '
-  to_entries[] as $t
-  | select($t.value | type=="object")
-  | $t.key as $tenant
-  | $t.value
-  | to_entries[] as $a
-  | select($a.value | type=="object" and ($a.value.class == "Application"))
-  | $a.key as $app
-  | $a.value
-  | to_entries[]
-  | select(.value | type=="object" and (.value.class == "Service_HTTP" or .value.class == "Service_HTTPS" or .value.class == "Service_L4"))
-  | .key as $vs
-  | .value as $svc
-  | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\(($svc.virtualAddresses? // [])|join(\",\")) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
-' "$TMP_AS3"
-
-rm -f "$TMP_AS3"
+  # Racine de travail : .declaration si présent, sinon l’objet lui-même
+  ( .declaration // . ) as $root
+  | $root
+  | if type != "object" then
+      empty
+    else
+      to_entries[]                    # tenants
+      | select(.value | type=="object")
+      | .key as $tenant
+      | .value
+      | to_entries[]                  # applications
+      | select(.value | type=="object" and (.value.class?=="Application"))
+      | .key as $app
+      | .value
+      | to_entries[]                  # objets de l’application
+      | select(.value | type=="object" and
+               (.value.class?=="Service_HTTP" or .value.class?=="Service_HTTPS" or .value.class?=="Service_L4"))
+      | .key   as $vs
+      | .value as $svc
+      | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
+    end
+' "$TMP_AS3" || {
+  echo "[ERR] Échec de l’extraction des VS via jq."
+  [[ $DEBUG -eq 1 ]] && { echo "--- JSON reçu (début) ---"; head -c 800 "$TMP_AS3"; echo; }
+  exit 3
+}
