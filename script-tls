@@ -14,19 +14,20 @@ curl -sS --insecure -u "$F5_USER" "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP
 
 echo
 echo "=== Corrélation des pools ==="
+
+# Parcours de tous les pools iControl
 while read -r pool; do
-    # Vérifie si la clé $pool existe quelque part dans la hiérarchie AS3
+    # Recherche d’une clé portant ce nom dans le 3e niveau (tenant > app > objets)
     found=$(jq -r --arg POOL "$pool" '
-        def walk(f):
-            . as $in
-            | if type == "object" then reduce keys[] as $key ({}; . + { ($key): ($in[$key] | walk(f)) }) | f
-              elif type == "array" then map(walk(f)) | f
-              else f end;
-        walk(.) | select(has($POOL)) | $POOL
+        to_entries[]?.value
+        | to_entries[]
+        | select(.value.class == "Application")
+        | select(.value[$POOL].class == "Pool")
+        | .key
     ' "$TMP_AS3" | head -n1)
 
     if [ -n "$found" ]; then
-        # Cherche un VS (Service_HTTPS / Service_L4) qui référence ce pool
+        # Trouver le VS (Service_HTTPS ou Service_L4) associé
         vs_name=$(jq -r --arg POOL "$pool" '
             .. | objects
             | select(has("class"))
@@ -36,9 +37,9 @@ while read -r pool; do
         ' "$TMP_AS3" | head -n1)
 
         if [ -n "$vs_name" ]; then
-            echo "✅ Pool '$pool' trouvé → VS associé : $vs_name"
+            echo "✅ Pool '$pool' trouvé dans l'application '$found' → VS associé : $vs_name"
         else
-            echo "⚠️  Pool '$pool' trouvé dans AS3 (pas de VS lié)"
+            echo "⚠️  Pool '$pool' trouvé dans l'application '$found' (aucun VS lié)"
         fi
     else
         echo "❌ Pool '$pool' non trouvé dans la déclaration AS3"
