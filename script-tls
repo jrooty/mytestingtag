@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# Test TLS (avec ou sans authentification mutuelle)
+# Usage :
+#   ./test_tls.sh <host> <port> [--cert client.crt --key client.key --ca ca.crt]
+
+HOST=$1
+PORT=$2
+shift 2
+
+CLIENT_CERT=""
+CLIENT_KEY=""
+CA_CERT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cert)
+      CLIENT_CERT=$2
+      shift 2
+      ;;
+    --key)
+      CLIENT_KEY=$2
+      shift 2
+      ;;
+    --ca)
+      CA_CERT=$2
+      shift 2
+      ;;
+    *)
+      echo "Argument inconnu : $1"
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$HOST" ] || [ -z "$PORT" ]; then
+  echo "Usage: $0 <host> <port> [--cert client.crt --key client.key --ca ca.crt]"
+  exit 1
+fi
+
+echo "=== Test de connexion TLS vers $HOST:$PORT ==="
+
+# Test TCP basique
+if ! timeout 5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null; then
+  echo "❌ Impossible de se connecter à $HOST:$PORT (TCP échoué)"
+  exit 2
+fi
+echo "✅ Connexion TCP OK"
+
+# Construction de la commande openssl
+CMD="openssl s_client -connect ${HOST}:${PORT} -servername ${HOST}"
+
+if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
+  CMD+=" -cert ${CLIENT_CERT} -key ${CLIENT_KEY}"
+  echo "🔐 Authentification client activée (certificat + clé)"
+fi
+
+if [ -n "$CA_CERT" ]; then
+  CMD+=" -CAfile ${CA_CERT}"
+  echo "🧾 Utilisation d’une autorité de certification personnalisée"
+fi
+
+# Exécution du handshake et capture du log complet
+TMP_OUT=$(mktemp)
+eval "$CMD" </dev/null >"$TMP_OUT" 2>&1
+
+# Détection demande d'authentification mutuelle
+echo
+echo "=== Détection d'une demande de certificat client ==="
+if grep -q "Acceptable client certificate CA names" "$TMP_OUT"; then
+  echo "🔒 Le serveur DEMANDE un certificat client (authentification mutuelle TLS requise)."
+
+  # Extraction des CA acceptées
+  echo
+  echo "🧾 Autorités de certification acceptées par le serveur :"
+  awk '/Acceptable client certificate CA names/{flag=1;next}/SSL handshake/{flag=0}flag' "$TMP_OUT" | sed '/^$/d' | sed 's/^/   • /'
+elif grep -q "SSL alert number 40" "$TMP_OUT"; then
+  echo "⚠️  Le serveur a rejeté la connexion faute de certificat client (Handshake failed)."
+else
+  echo "✅ Le serveur n’exige PAS de certificat client."
+fi
+
+# Détails TLS
+echo
+echo "=== Détails TLS ==="
+grep -E 'Verification|Protocol|Cipher|Start Time|Expire' "$TMP_OUT"
+
+# Vérification du certificat serveur
+echo
+echo "=== Vérification du certificat serveur ==="
+cat "$TMP_OUT" | openssl x509 -noout -dates -subject -issuer 2>/dev/null
+if [ $? -eq 0 ]; then
+  echo "✅ Certificat serveur récupéré avec succès."
+else
+  echo "⚠️  Impossible de récupérer le certificat serveur."
+fi
+
+# Vérification expiration
+echo
+echo "=== Vérification expiration ==="
+END_DATE=$(cat "$TMP_OUT" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+if [ -n "$END_DATE" ]; then
+  END_TS=$(date -d "$END_DATE" +%s 2>/dev/null)
+  NOW_TS=$(date +%s)
+  DAYS_LEFT=$(( (END_TS - NOW_TS) / 86400 ))
+  echo "Le certificat expire dans $DAYS_LEFT jours."
+  if [ $DAYS_LEFT -lt 30 ]; then
+    echo "⚠️  Attention : le certificat expire bientôt !"
+  else
+    echo "✅ Certificat encore valide."
+  fi
+else
+  echo "⚠️  Impossible de calculer la date d’expiration."
+fi
+
+rm -f "$TMP_OUT"
