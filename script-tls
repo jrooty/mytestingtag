@@ -26,6 +26,14 @@ jq -r '
   else empty end)
 ' "$TMP_AS3" | grep -v '^\s*$' | sort -u > as3_pools.txt
 
+# 💡 DEBUG : afficher ce que jq a trouvé
+echo
+echo "=== DEBUG: Liste des pools trouvés dans la déclaration AS3 ==="
+cat as3_pools.txt
+echo "=============================================================="
+echo
+
+# 5️⃣ Matching iControl → AS3
 echo "Matching pools iControl → AS3 :"
 while read -r POOL_NAME; do
     if grep -q "/${POOL_NAME}$" as3_pools.txt; then
