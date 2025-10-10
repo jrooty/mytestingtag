@@ -1,25 +1,16 @@
 #!/bin/bash
-# Classement des Virtual Servers BIG-IP : fastl4 / https / http / other
-# Fonctionne sur toutes partitions. Nécessite tmsh.
+# Liste tous les VS (toutes partitions) et indique fastl4 / https / http
+# Détection basée sur des noms standardisés de profil :
+#  - fastl4 : présence d'un profil contenant "PrfFastl4"
+#  - https  : présence simultanée de "PrfCSSL" et "PrfHTTP"
+#  - http   : présence de "PrfHTTP" sans "PrfCSSL"
+# Sinon : "other"
 
 set -eo pipefail
 
-# -- Inventaire des profils (chemins complets /Partition/Nom). Tolère absence d’une classe.
-tmsh -q -c 'cd /; list ltm profile fastl4   recursive one-line' | sed -n 's/^ltm profile fastl4 \([^ ]\+\).*/\1/p' > /tmp/_fastl4.lst  || true
-tmsh -q -c 'cd /; list ltm profile client-ssl recursive one-line' | sed -n 's/^ltm profile client-ssl \([^ ]\+\).*/\1/p' > /tmp/_clientssl.lst || true
-tmsh -q -c 'cd /; list ltm profile http     recursive one-line' | sed -n 's/^ltm profile http \([^ ]\+\).*/\1/p' > /tmp/_http.lst     || true
-
-# Si une liste est vide, on met quelque chose d’inoffensif pour grep -f
-for f in /tmp/_fastl4.lst /tmp/_clientssl.lst /tmp/_http.lst; do
-  if [ ! -s "$f" ]; then echo "__no_profile__" > "$f"; fi
-done
-
-# En-tête
-printf "%-28s %-40s %-24s %-8s\n" "PARTITION" "VS_NAME" "DESTINATION" "TYPE"
-
-# -- Tous les VS (une ligne par VS, toutes partitions)
+# Récupère toutes les virtuals en une ligne (toutes partitions)
 tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null | while IFS= read -r line; do
-  # Chemin VS (/Partition/VS)
+  # Chemin VS (/Partition/Name)
   vs_path=$(awk '{for (i=1;i<=NF;i++) if ($i=="virtual") {print $(i+1); break}}' <<<"$line")
   [ -z "$vs_path" ] && continue
   part="${vs_path%/*}"; part="${part#/}"
@@ -29,36 +20,32 @@ tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null | while IFS= 
   dest=$(awk '{for (i=1;i<=NF;i++) if ($i=="destination") {print $(i+1); break}}' <<<"$line")
   [[ "$dest" == */*:* ]] && dest="${dest##*/}"
 
-  # Profils attachés (bloc inline si présent)
+  # Extraire le bloc profiles { ... } sur la one-line
   prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$line" || true)
-  # Fallback: récupérer les profils du VS si le bloc n’est pas dans la “one-line”
+
+  # Fallback : si le bloc n'est pas présent, on récupère les profils pour ce VS
   if [ -z "$prof_block" ]; then
     vs_prof_line=$(tmsh -q -c "list ltm virtual ${vs_path} profiles one-line" 2>/dev/null || true)
     prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$vs_prof_line" || true)
   fi
 
-  # Détection par priorité : fastl4 > https (client-ssl) > http > other
-  vs_type="other"
+  # Normaliser en minuscules pour un match tolérant (PrfHTTP/prfHTTP…)
+  prof_lc=$(echo "$prof_block" | tr '[:upper:]' '[:lower:]')
 
-  # 1) fastl4 ?
-  #   - si un des profils attachés correspond à un chemin de /tmp/_fastl4.lst
-  #   - ou si le mot 'fastl4' apparait brut (rare mais possible)
-  if echo "$prof_block" | grep -Ff /tmp/_fastl4.lst -q || grep -qw fastl4 <<<"$prof_block"; then
+  # Flags selon tes patterns
+  has_fastl4=0; has_http=0; has_cssl=0
+  [[ "$prof_lc" == *prffastl4* ]] && has_fastl4=1
+  [[ "$prof_lc" == *prfhttp*   ]] && has_http=1
+  [[ "$prof_lc" == *prfcssl*   ]] && has_cssl=1
+
+  # Classement par priorité
+  vs_type="other"
+  if [ $has_fastl4 -eq 1 ]; then
     vs_type="fastl4"
-  else
-    # 2) https ? (client-ssl)
-    #   - match sur chemins connus
-    #   - OU présence du token 'clientssl' brut (profil par défaut sans chemin)
-    if echo "$prof_block" | grep -Ff /tmp/_clientssl.lst -q || grep -qw clientssl <<<"$prof_block"; then
-      vs_type="https"
-    else
-      # 3) http ?
-      #   - match sur chemins de profils http
-      #   - OU token 'http' brut
-      if echo "$prof_block" | grep -Ff /tmp/_http.lst -q || grep -qw http <<<"$prof_block"; then
-        vs_type="http"
-      fi
-    fi
+  elif [ $has_http -eq 1 ] && [ $has_cssl -eq 1 ]; then
+    vs_type="https"
+  elif [ $has_http -eq 1 ] && [ $has_cssl -eq 0 ]; then
+    vs_type="http"
   fi
 
   printf "%-28s %-40s %-24s %-8s\n" "$part" "$vs_name" "${dest:-"-"}" "$vs_type"
