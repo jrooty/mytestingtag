@@ -2,28 +2,50 @@
 set -e
 TMP_POOLS=$(mktemp)
 TMP_AS3=$(mktemp)
+TMP_MEMBERS=$(mktemp)
 
 # 1️⃣ Récupérer tous les pools
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_POOLS"
 
-# 2️⃣ Lister pool et membres
+# 2️⃣ Lister pools et leurs membres
 jq -r '.items? // [] | .[] | "\(.name) \(.membersReference.link // "")"' "$TMP_POOLS" > pools_list.txt
 
-echo "Pools et pool members récupérés via iControl REST :"
-cat pools_list.txt
+# Télécharger tous les pool members
+while read -r line; do
+    POOL_NAME=$(echo "$line" | awk '{print $1}')
+    LINK=$(echo "$line" | awk '{print $2}')
+    if [ -n "$LINK" ]; then
+        curl -sS --insecure -u admin: "http://localhost:8100$LINK" -o "$TMP_MEMBERS"
+        MEMBERS=$(jq -r '.items? // [] | .[].name' "$TMP_MEMBERS")
+        for M in $MEMBERS; do
+            echo "$POOL_NAME $M"
+        done
+    fi
+done < pools_list.txt > pool_members.txt
+
+echo "Pools et leurs membres récupérés via iControl REST :"
+cat pool_members.txt
 
 # 3️⃣ Récupérer déclaration AS3
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
 
-# 4️⃣ Corréler pool → VS via AS3
+# 4️⃣ Corrélation Pool → VS via AS3 (dans les LTP)
 echo
-echo "Corrélation Pool → VS via AS3 :"
+echo "Corrélation Pool → VS via AS3 (LTP) :"
 while read -r line; do
     POOL_NAME=$(echo "$line" | awk '{print $1}')
-    # Cherche un VS qui référence ce pool
-    VS_NAME=$(jq -r --arg p "$POOL_NAME" '.. | objects | select(.class=="Pool" and .name==$p) | path(..) | .[-2] // empty' "$TMP_AS3")
-    [ -z "$VS_NAME" ] && VS_NAME="(VS non trouvé)"
-    echo "Pool=${POOL_NAME} VS=${VS_NAME}"
-done < pools_list.txt
+    MEMBER_NAME=$(echo "$line" | awk '{print $2}')
+    
+    # Cherche pool dans LTP et remonte VS
+    VS_NAME=$(jq -r --arg pool "$POOL_NAME" '
+        .. | objects
+        | select(.class=="Pool" and .name==$pool)
+        | path(..) as $p
+        | ($p[-2] // "(VS non trouvé)")
+    ' "$TMP_AS3")
 
-rm -f "$TMP_POOLS" "$TMP_AS3"
+    [ -z "$VS_NAME" ] && VS_NAME="(VS non trouvé)"
+    echo "VS=${VS_NAME} Pool=${POOL_NAME} Member=${MEMBER_NAME}"
+done < pool_members.txt
+
+rm -f "$TMP_POOLS" "$TMP_AS3" "$TMP_MEMBERS"
