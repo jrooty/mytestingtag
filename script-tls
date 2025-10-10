@@ -4,19 +4,24 @@ TMP_POOLS=$(mktemp)
 TMP_AS3=$(mktemp)
 
 # 1️⃣ Récupérer tous les pools via iControl REST
-curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_POOLS"
+curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool -o "$TMP_POOLS"
 
-# 2️⃣ Lister pools iControl
+# 2️⃣ Extraire les noms des pools iControl
 jq -r '.items? // [] | .[] | .name' "$TMP_POOLS" > pools_list.txt
 
-# 3️⃣ Récupérer déclaration AS3
+# 3️⃣ Récupérer la déclaration AS3
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
 
-# 4️⃣ Matching pool iControl → pool AS3
+# 4️⃣ Extraire les noms des pools dans AS3 (clés JSON dont class == Pool)
+jq -r '
+  .. | objects
+  | to_entries? // empty
+  | .[] | select(.value.class == "Pool") | .key
+' "$TMP_AS3" | sort -u > as3_pools.txt
+
 echo "Matching pools iControl → AS3 :"
 while read -r POOL_NAME; do
-    AS3_EXISTS=$(jq -e --arg p "$POOL_NAME" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3")
-    if [ -n "$AS3_EXISTS" ]; then
+    if grep -qx "$POOL_NAME" as3_pools.txt; then
         echo "Pool=${POOL_NAME} AS3_FOUND=OK"
     else
         echo "Pool=${POOL_NAME} AS3_FOUND=KO"
