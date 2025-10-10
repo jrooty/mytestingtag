@@ -1,70 +1,54 @@
 #!/bin/bash
 set -euo pipefail
 
-F5_URL="http://localhost:8100"
-AUTH="admin:"           # identifiant, mot de passe vide
-TMP_AS3="$(mktemp)"
-trap 'rm -f "$TMP_AS3"' EXIT
+# Ce script nécessite l'exécution sur un BIG-IP avec tmsh.
+# Il parcourt toutes les partitions et classe chaque VS :
+# - fastl4  : s'il a un profil fastL4
+# - https   : s'il a un profil clientssl (front-end SSL)
+# - http    : s'il a un profil http (sans clientssl)
+# - other   : sinon
 
-echo "[INFO] GET $F5_URL/mgmt/shared/appsvcs/declare"
-if ! curl -sS --fail --insecure -u "$AUTH" -H 'Accept: application/json' \
-  "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"; then
-  echo "[ERR] Impossible de récupérer la déclaration AS3." >&2
-  exit 1
-fi
+# Récupération en "one-line" de tous les VS, récursivement (toutes partitions)
+# On force la racine "/" pour couvrir *toutes* les partitions.
+mapfile -t LINES < <(tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null || true)
 
-# Vérifie JSON
-if ! jq -e . >/dev/null 2>&1 <"$TMP_AS3"; then
-  echo "[ERR] Réponse non-JSON. Extrait :" >&2
-  head -c 500 "$TMP_AS3" >&2
-  exit 2
-fi
+# En-tête
+printf "%-30s %-35s %-22s %-8s\n" "PARTITION" "VS_NAME" "DESTINATION" "TYPE"
 
-# Parcours sûr des Tenants -> Applications -> Services (HTTP/HTTPS/L4)
-jq -r '
-  # Choisir la racine: .declaration si présent, sinon la valeur brute
-  (.declaration // .) as $root
-  | ( $root | type ) as $t
-  | if $t == "object" then
-      # Cas racine = objet de tenants
-      $root
-      | to_entries[]                               # tenants
-      | select(.value | type=="object")
-      | .key as $tenant
-      | .value
-      | to_entries[]                               # applications
-      | select(.value | type=="object" and (.value.class?=="Application"))
-      | .key as $app
-      | .value
-      | to_entries[]                               # objets applicatifs
-      | select(.value | type=="object"
-               and ((.value.class?=="Service_HTTP")
-                 or (.value.class?=="Service_HTTPS")
-                 or (.value.class?=="Service_L4")))
-      | .key   as $vs
-      | .value as $svc
-      | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
-    elif $t == "array" then
-      # Cas racine = tableau de tenants
-      $root[]
-      | select(type=="object")
-      | to_entries[]                               # tenants
-      | select(.value | type=="object")
-      | .key as $tenant
-      | .value
-      | to_entries[]                               # applications
-      | select(.value | type=="object" and (.value.class?=="Application"))
-      | .key as $app
-      | .value
-      | to_entries[]                               # objets applicatifs
-      | select(.value | type=="object"
-               and ((.value.class?=="Service_HTTP")
-                 or (.value.class?=="Service_HTTPS")
-                 or (.value.class?=="Service_L4")))
-      | .key   as $vs
-      | .value as $svc
-      | "\($tenant)/\($app) VS=\($vs) type=\($svc.class) vip=\((($svc.virtualAddresses? // [])|join(\",\"))) port=\($svc.virtualPort? // \"\") pool=\($svc.pool? // \"\")"
-    else
-      empty
-    end
-' "$TMP_AS3"
+for line in "${LINES[@]}"; do
+  # Exemple de début de ligne:
+  # ltm virtual /Common/vs_name { destination /Common/10.0.0.1:443 ip-protocol tcp profiles { http { } clientssl { } } ... }
+
+  # Extraire le chemin complet du VS (/Partition/Name)
+  vs_path=$(awk '{for (i=1;i<=NF;i++) if ($i=="virtual") {print $(i+1); break}}' <<<"$line")
+  [[ -z "$vs_path" ]] && continue
+
+  # Partition et nom
+  part="${vs_path%/*}"; part="${part#/}"           # /Common -> Common
+  vs_name="${vs_path##*/}"                         # /Common/vs -> vs
+
+  # Destination (token "destination" + champ suivant)
+  dest=$(awk '{for (i=1;i<=NF;i++) if ($i=="destination") {print $(i+1); break}}' <<<"$line")
+  # Le champ destination peut être /Common/1.2.3.4:443 -> on n'affiche que l'IP:port
+  if [[ "$dest" == */*:* ]]; then
+    dest="${dest##*/}"
+  fi
+
+  # Extraire la sous-chaîne du bloc profiles { ... } (toute la ligne est en une seule ligne)
+  # On tolère l'absence de bloc profiles.
+  profiles_raw=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$line" || true)
+  profiles_lc=$(echo "${profiles_raw,,}" )  # to lowercase
+
+  # Détection du type
+  # Priorité : fastl4 > https (clientssl) > http > other
+  vs_type="other"
+  if grep -q 'fastl4' <<<"$profiles_lc"; then
+    vs_type="fastl4"
+  elif grep -q 'clientssl' <<<"$profiles_lc"; then
+    vs_type="https"
+  elif grep -q -w 'http' <<<"$profiles_lc"; then
+    vs_type="http"
+  fi
+
+  printf "%-30s %-35s %-22s %-8s\n" "$part" "$vs_name" "${dest:-"-"}" "$vs_type"
+done
