@@ -1,17 +1,6 @@
 #!/bin/bash
 set -o pipefail
 
-# Test TLS (avec ou sans authentification mutuelle)
-# Usage :
-#   ./test_tls.sh <host|file> <port par défaut> [--cert client.crt --key client.key --ca ca.crt] [--verbose] [--exit-on-fail]
-#
-# Codes retour :
-# 0 = tout OK
-# 1 = échec TCP
-# 2 = échec TLS (handshake)
-# 3 = mTLS requis mais aucun cert client fourni
-# 4 = cert client fourni mais handshake mTLS échoué
-
 OPENSSL_TIMEOUT=12
 TCP_TIMEOUT=5
 EXIT_ON_FAIL=0
@@ -50,8 +39,8 @@ check_target() {
 
     "${CMD[@]}" </dev/null >"$TMP_OUT" 2>&1 || true
 
-    # TLS ok si un certificat serveur ou un Cipher est visible
-    if [ -s "$TMP_OUT" ] && (grep -q 'Cipher is ' "$TMP_OUT" || grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"); then
+    # TLS ok si un certificat serveur est présent
+    if [ -s "$TMP_OUT" ] && grep -q 'BEGIN CERTIFICATE' "$TMP_OUT"; then
       TLS_STATUS="OK"
     else
       TLS_STATUS="KO"
@@ -149,7 +138,7 @@ check_target() {
       openssl x509 -in "${TMP_OUT}.pem" -noout -subject -issuer -dates || echo "(impossible d'analyser le certificat)"
       rm -f "${TMP_OUT}.pem"
     else
-      echo "(aucun certificat serveur trouvé)"
+      echo "(aucun certificat serveur trouvé → TLS KO)"
     fi
 
     echo
