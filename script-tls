@@ -1,10 +1,104 @@
+#!/bin/bash
+set -o pipefail
+
+# Test TLS (avec ou sans authentification mutuelle)
+# Usage :
+#   ./test_tls.sh <host|file> <port par défaut> [--cert client.crt --key client.key --ca ca.crt] [--verbose] [--exit-on-fail]
+#
+# Si <host|file> est un fichier :
+#   - chaque ligne peut être "hôte" ou "hôte:port"
+#   - lignes vides ou commençant par # sont ignorées
+#
+# Codes retour :
+# 0 = tout OK
+# 1 = échec TCP
+# 2 = échec TLS (handshake)
+# 3 = mTLS requis mais aucun cert client fourni
+# 4 = cert client fourni mais handshake mTLS échoué
+
+# ------------------------------
+# Paramètres globaux
+# ------------------------------
+OPENSSL_TIMEOUT=12   # timeout en secondes pour la commande openssl (handshake)
+TCP_TIMEOUT=5        # timeout en secondes pour test TCP
+EXIT_ON_FAIL=0
+
+# ------------------------------
+# Fonction : check_target
+# ------------------------------
+check_target() {
+  local HOST="$1"
+  local PORT="$2"
+  local CLIENT_CERT="$3"
+  local CLIENT_KEY="$4"
+  local CA_CERT="$5"
+  local VERBOSE="$6"
+
+  local TMP_OUT
+  TMP_OUT=$(mktemp)
+
+  local TCP_STATUS="KO"
+  local TLS_STATUS="KO"
+  local MTLS_STATUS="N/A"
+  local IP
+
+  # Résolution DNS -> IP
+  IP=$(getent ahosts "$HOST" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+  [ -z "$IP" ] && IP="(résolution échouée)"
+
+  # Test TCP
+  if timeout ${TCP_TIMEOUT} bash -c "</dev/tcp/${HOST}/${PORT}" 2>/dev/null; then
+    TCP_STATUS="OK"
+  else
+    TCP_STATUS="KO"
+  fi
+
+  # Test TLS si TCP OK
+  if [ "$TCP_STATUS" = "OK" ]; then
+    CMD=(timeout "${OPENSSL_TIMEOUT}" openssl s_client -connect "${HOST}:${PORT}" -servername "${HOST}" -showcerts)
+    [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ] && CMD+=(-cert "${CLIENT_CERT}" -key "${CLIENT_KEY}")
+    [ -n "$CA_CERT" ] && CMD+=(-CAfile "${CA_CERT}")
+
+    "${CMD[@]}" </dev/null >"$TMP_OUT" 2>&1 || true
+
+    if grep -q -E 'Protocol:|Cipher:' "$TMP_OUT" || grep -q "Verify return code: 0 (ok)" "$TMP_OUT"; then
+      TLS_STATUS="OK"
+    else
+      TLS_STATUS="KO"
+    fi
+
+    # Détection mTLS
+    if grep -q "Acceptable client certificate CA names" "$TMP_OUT" || grep -q "SSL alert number 40" "$TMP_OUT"; then
+      if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
+        if [ "$TLS_STATUS" = "OK" ]; then
+          MTLS_STATUS="OK"
+        else
+          MTLS_STATUS="FAIL"
+        fi
+      else
+        MTLS_STATUS="REQ"
+      fi
+    else
+      if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ]; then
+        if [ "$TLS_STATUS" = "OK" ]; then
+          MTLS_STATUS="OK"
+        else
+          MTLS_STATUS="FAIL"
+        fi
+      else
+        MTLS_STATUS="NO"
+      fi
+    fi
+  else
+    TLS_STATUS="KO"
+    MTLS_STATUS="N/A"
+  fi
+
   # ------------------------------
   # Affichage condensé ou verbose
   # ------------------------------
   if [ "$VERBOSE" -eq 0 ]; then
     PREFIX=""
-
-    # Priorité ERR > WARN
     if [ "$TCP_STATUS" = "KO" ] || [ "$TLS_STATUS" = "KO" ] || [ "$MTLS_STATUS" = "FAIL" ]; then
       PREFIX="[ERR] "
     elif [ "$MTLS_STATUS" = "REQ" ]; then
@@ -17,6 +111,127 @@
       echo "${PREFIX}${HOST}:${PORT} (${IP}) TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
     fi
   else
-    # verbose inchangé
-    ...
+    # verbose complet
+    echo
+    echo "=== Test TLS -> ${HOST}:${PORT} (${IP}) ==="
+    echo "Résultats synthétiques : TCP=${TCP_STATUS} TLS=${TLS_STATUS} mTLS=${MTLS_STATUS}"
+    [ -n "$CLIENT_CERT" ] && echo "Cert client fourni : $CLIENT_CERT (key: ${CLIENT_KEY:-(non fourni)})"
+    [ -n "$CA_CERT" ] && echo "CA fournie : $CA_CERT"
+    echo
+
+    if [ "$TCP_STATUS" != "OK" ]; then
+      echo "❌ Connexion TCP échouée (timeout=${TCP_TIMEOUT}s)."
+      echo "IP résolue : ${IP}"
+      echo "=== sortie openssl (si existant) ==="
+      [ -s "$TMP_OUT" ] && sed -n '1,200p' "$TMP_OUT"
+      rm -f "$TMP_OUT"
+      return 1
+    fi
+
+    echo "✅ Connexion TCP OK"
+
+    echo
+    echo "=== Détection mTLS ==="
+    if [ "$MTLS_STATUS" = "REQ" ]; then
+      echo "🔒 Serveur DEMANDE un certificat client (mTLS)."
+      awk '/Acceptable client certificate CA names/{flag=1;next}/^$/{if(flag) exit}flag' "$TMP_OUT" | sed '/^$/d' | sed 's/^/   • /' || true
+    elif [ "$MTLS_STATUS" = "OK" ]; then
+      echo "🔐 Authentification mutuelle : OK"
+    elif [ "$MTLS_STATUS" = "FAIL" ]; then
+      echo "❌ Authentification mutuelle : FAIL (cert client fourni mais handshake échoué)"
+      tail -n 60 "$TMP_OUT" || true
+    else
+      echo "✅ Le serveur n'exige PAS de certificat client."
+    fi
+
+    echo
+    echo "=== Détails TLS ==="
+    grep -E 'Protocol:|Cipher:|Verify return code:' "$TMP_OUT" || true
+
+    echo
+    echo "=== Certificat serveur (sommaire) ==="
+    awk 'BEGIN{cert=0} /-----BEGIN CERTIFICATE-----/{cert=1; print; next} /-----END CERTIFICATE-----/{if(cert){print; exit}} cert{print}' "$TMP_OUT" >"${TMP_OUT}.pem" 2>/dev/null || true
+    if [ -s "${TMP_OUT}.pem" ]; then
+      openssl x509 -in "${TMP_OUT}.pem" -noout -subject -issuer -dates || echo "(impossible d'analyser le certificat)"
+      rm -f "${TMP_OUT}.pem"
+    else
+      echo "(aucun certificat serveur trouvé dans la sortie openssl)"
+    fi
+
+    echo
+    echo "=== Fin verbose ==="
   fi
+
+  rm -f "$TMP_OUT"
+
+  # ------------------------------
+  # Codes retour
+  # ------------------------------
+  if [ "$TCP_STATUS" != "OK" ]; then return 1; fi
+  if [ "$TLS_STATUS" != "OK" ]; then
+    if [ "$MTLS_STATUS" = "REQ" ] && { [ -z "$CLIENT_CERT" ] || [ -z "$CLIENT_KEY" ]; }; then return 3; fi
+    if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ] && [ "$MTLS_STATUS" = "FAIL" ]; then return 4; fi
+    return 2
+  fi
+  if [ "$MTLS_STATUS" = "REQ" ] && { [ -z "$CLIENT_CERT" ] || [ -z "$CLIENT_KEY" ]; }; then return 3; fi
+  if [ -n "$CLIENT_CERT" ] && [ -n "$CLIENT_KEY" ] && [ "$MTLS_STATUS" = "FAIL" ]; then return 4; fi
+
+  return 0
+}
+
+# ------------------------------
+# Parsing args
+# ------------------------------
+TARGET="$1"
+DEFAULT_PORT="$2"
+shift 2
+
+CLIENT_CERT=""
+CLIENT_KEY=""
+CA_CERT=""
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cert) CLIENT_CERT="$2"; shift 2 ;;
+    --key) CLIENT_KEY="$2"; shift 2 ;;
+    --ca) CA_CERT="$2"; shift 2 ;;
+    --verbose) VERBOSE=1; shift ;;
+    --exit-on-fail) EXIT_ON_FAIL=1; shift ;;
+    *) echo "Argument inconnu : $1"; exit 1 ;;
+  esac
+done
+
+if [ -z "$TARGET" ] || [ -z "$DEFAULT_PORT" ]; then
+  echo "Usage: $0 <host|file> <port par défaut> [--cert client.crt --key client.key --ca ca.crt] [--verbose] [--exit-on-fail]"
+  exit 1
+fi
+
+# ------------------------------
+# Traitement targets
+# ------------------------------
+GLOBAL_RC=0
+
+if [ -f "$TARGET" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^# ]] && continue
+
+    HOST="$(echo "$line" | cut -d: -f1)"
+    PORT_IN_LINE="$(echo "$line" | cut -s -d: -f2)"
+    PORT="${PORT_IN_LINE:-$DEFAULT_PORT}"
+
+    check_target "$HOST" "$PORT" "$CLIENT_CERT" "$CLIENT_KEY" "$CA_CERT" "$VERBOSE"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      GLOBAL_RC=$rc
+      [ "$EXIT_ON_FAIL" -eq 1 ] && exit $GLOBAL_RC
+    fi
+  done < "$TARGET"
+else
+  check_target "$TARGET" "$DEFAULT_PORT" "$CLIENT_CERT" "$CLIENT_KEY" "$CA_CERT" "$VERBOSE"
+  exit $?
+fi
+
+exit $GLOBAL_RC
