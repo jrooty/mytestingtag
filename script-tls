@@ -65,7 +65,14 @@ correlate_pool_as3() {
         POOL=$(echo $line | awk '{print $1}')
         MEMBER=$(echo $line | awk '{print $2}')
 
-        AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
+        if [ "$LOCAL_FULL" -eq 1 ]; then
+            # Récupérer tous les pools, aucun filtre
+            AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
+        else
+            # Filtre par défaut : exclure fastl4 et pools sans C3D
+            AS3_EXISTS=$(jq -e --arg p "$POOL" '.. | objects | select(.class=="Pool" and .name==$p) // empty' "$TMP_AS3" 2>/dev/null)
+        fi
+
         if [ -n "$AS3_EXISTS" ]; then
             echo "$POOL $MEMBER [AS3]" >> "${TMP_MEMS}_correlated"
         else
