@@ -27,7 +27,7 @@ colorize_status() {
 }
 
 # ------------------------------
-# Récupération des VS et pools (directs + LTP)
+# Récupération des VS et pools (directs + LTP statiques)
 # ------------------------------
 fetch_bigip_local_vs() {
     TMP_JSON=$(mktemp)
@@ -62,11 +62,11 @@ fetch_bigip_local_vs() {
                 fi
             fi
 
-            # Collecte pools: direct
+            # Collecte pools directs
             POOLS=()
             [ "$POOL_DIRECT" != "null" ] && POOLS+=("$POOL_DIRECT")
 
-            # Collecte pools: via LTP
+            # Collecte pools via LTP (statiques seulement)
             if [ "$POLICIES_LINK" != "null" ]; then
                 POL_JSON=$(mktemp)
                 curl -sS --insecure -u admin: "$POLICIES_LINK" -o "$POL_JSON"
@@ -76,8 +76,17 @@ fetch_bigip_local_vs() {
                 for pol in "${POLICY_ITEMS[@]}"; do
                     RULES_JSON=$(mktemp)
                     curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/policy/$pol/rules" -o "$RULES_JSON"
-                    # Extraction pools dans actions 'forward' ou 'select pool'
-                    mapfile -t RULE_POOLS < <(jq -r '.items[]?.actions[]? | select(.forward && .forward.pool) | .forward.pool' "$RULES_JSON")
+
+                    # Extraire pools statiques (forward.pool ou select.pool)
+                    RULE_POOLS=()
+                    mapfile -t RULE_POOLS < <(jq -r '.items[]?.actions[]? | select(.forward?.pool) | .forward.pool' "$RULES_JSON")
+                    mapfile -t SELECT_POOLS < <(jq -r '.items[]?.actions[]? | select(.select?.pool) | .select.pool' "$RULES_JSON")
+                    RULE_POOLS+=("${SELECT_POOLS[@]}")
+
+                    if [ "${#RULE_POOLS[@]}" -eq 0 ]; then
+                        echo "[WARN] VS=$VS_NAME, policy=$pol : aucune pool statique détectée (peut être dynamique)"
+                    fi
+
                     POOLS+=("${RULE_POOLS[@]}")
                     rm -f "$RULES_JSON"
                 done
