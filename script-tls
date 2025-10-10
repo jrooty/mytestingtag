@@ -1,29 +1,43 @@
 #!/bin/bash
 set -euo pipefail
 
-# Parcourt toutes les partitions et classe chaque VS :
-# - fastl4  : si un profil fastl4 est attaché
-# - https   : si un profil client-ssl (peu importe son nom) est attaché côté VS
-# - http    : si un profil http est attaché (et pas client-ssl / fastl4)
-# - other   : sinon
+DEBUG=0
+[[ "${1:-}" == "--debug" ]] && DEBUG=1
 
-# 1) Récupérer les profils disponibles par type (chemins complets /Partition/Nom)
-mapfile -t CLIENTSSL_PROFILES < <(tmsh -q -c 'cd /; list ltm profile client-ssl recursive one-line' \
-  | sed -n 's/^ltm profile client-ssl \([^ ]\+\).*/\1/p')
+# --- Helpers ---
+lower() { awk '{print tolower($0)}'; }
 
-mapfile -t HTTP_PROFILES < <(tmsh -q -c 'cd /; list ltm profile http recursive one-line' \
-  | sed -n 's/^ltm profile http \([^ ]\+\).*/\1/p')
+# Remplit un tableau de profils à partir d'une commande tmsh ; tolère l'absence de la classe
+#  $1 = commande tmsh
+#  echo -> lignes /Partition/Nom
+load_profiles() {
+  local cmd="$1"
+  tmsh -q -c "$cmd" 2>/dev/null \
+    | sed -n 's/^ltm profile [^ ]\+ \([^ ]\+\).*/\1/p' \
+    || true
+}
 
-mapfile -t FASTL4_PROFILES < <(tmsh -q -c 'cd /; list ltm profile fastl4 recursive one-line' \
-  | sed -n 's/^ltm profile fastl4 \([^ ]\+\).*/\1/p')
+# --- 1) Inventaire des profils par type (chemins complets) ---
+mapfile -t CLIENTSSL_PROFILES < <(load_profiles 'cd /; list ltm profile client-ssl recursive one-line')
+mapfile -t TLSCLIENT_PROFILES  < <(load_profiles 'cd /; list ltm profile tls-client  recursive one-line')
+mapfile -t HTTP_PROFILES       < <(load_profiles 'cd /; list ltm profile http        recursive one-line')
+mapfile -t FASTL4_PROFILES     < <(load_profiles 'cd /; list ltm profile fastl4      recursive one-line')
 
-# Convertir en "ensembles" bash (associatifs) pour lookup O(1)
-declare -A SET_CLIENTSSL SET_HTTP SET_FASTL4
-for p in "${CLIENTSSL_PROFILES[@]}"; do SET_CLIENTSSL["$p"]=1; done
-for p in "${HTTP_PROFILES[@]}";     do SET_HTTP["$p"]=1;     done
-for p in "${FASTL4_PROFILES[@]}";   do SET_FASTL4["$p"]=1;   done
+# Sets par chemin complet
+declare -A SET_CLIENTSSL SET_TLSCLIENT SET_HTTP SET_FASTL4
+for p in "${CLIENTSSL_PROFILES[@]}"; do [[ -n "$p" ]] && SET_CLIENTSSL["$p"]=1; done
+for p in "${TLSCLIENT_PROFILES[@]}";  do [[ -n "$p" ]] && SET_TLSCLIENT["$p"]=1;  done
+for p in "${HTTP_PROFILES[@]}";       do [[ -n "$p" ]] && SET_HTTP["$p"]=1;       done
+for p in "${FASTL4_PROFILES[@]}";     do [[ -n "$p" ]] && SET_FASTL4["$p"]=1;     done
 
-# 2) Récupérer tous les VS (toutes partitions) en one-line
+# Maps par nom court -> chemin complet (pour résoudre les profils attachés sans /Partition/)
+declare -A NAME2_CLIENTSSL NAME2_TLSCLIENT NAME2_HTTP NAME2_FASTL4
+for p in "${CLIENTSSL_PROFILES[@]}"; do n="${p##*/}"; NAME2_CLIENTSSL["$n"]="$p"; done
+for p in "${TLSCLIENT_PROFILES[@]}";  do n="${p##*/}"; NAME2_TLSCLIENT["$n"]="$p";  done
+for p in "${HTTP_PROFILES[@]}";       do n="${p##*/}"; NAME2_HTTP["$n"]="$p";       done
+for p in "${FASTL4_PROFILES[@]}";     do n="${p##*/}"; NAME2_FASTL4["$n"]="$p";     done
+
+# --- 2) Récupérer tous les VS (toutes partitions) ---
 mapfile -t VS_LINES < <(tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null || true)
 
 # En-tête
@@ -40,40 +54,63 @@ for line in "${VS_LINES[@]}"; do
   dest=$(awk '{for (i=1;i<=NF;i++) if ($i=="destination") {print $(i+1); break}}' <<<"$line")
   [[ "$dest" == */*:* ]] && dest="${dest##*/}"
 
-  # Extraire le bloc profiles {...} puis tous les chemins /Partition/Profil
+  # Bloc des profils ; fallback si absent
   prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$line" || true)
-  # Quand le bloc est absent sur cette ligne (selon versions), on requête ciblé
   if [[ -z "$prof_block" ]]; then
-    # Récupérer les profils de ce VS uniquement (one-line)
     vs_profiles_line=$(tmsh -q -c "list ltm virtual ${vs_path} profiles one-line" 2>/dev/null || true)
     prof_block=$(sed -n 's/.*profiles { \(.*\) }.*/\1/p' <<<"$vs_profiles_line" || true)
   fi
 
-  # Liste des profils attachés (chemins complets)
-  # On matche des tokens /Partition/Nom juste avant une accolade ou un espace
-  readarray -t ATTACHED < <(grep -oE '/[^ /]*/[^ {]+' <<<"$prof_block" || true)
+  # Extraire tokens de profils :
+  #  - chemins complets : /Partition/Nom
+  #  - noms courts     : token juste avant '{' ou séparés par espaces
+  declare -a TOKENS=()
+  # chemins complets
+  while read -r tok; do [[ -n "$tok" ]] && TOKENS+=("$tok"); done < <(grep -oE '/[^ {]*/[^ {]+' <<<"$prof_block" || true)
+  # noms courts éventuels (http, clientssl-pers, etc.)
+  # on repère les mots avant '{' ou isolés ; on filtre ceux qui ressemblent à des clés 'app-service' etc.
+  while read -r short; do
+    [[ -z "$short" ]] && continue
+    # ignorer déjà présents en /Partition/Nom
+    [[ "$short" == /*/* ]] && continue
+    TOKENS+=("$short")
+  done < <(tr '{}' '  ' <<<"$prof_block" | awk '{for(i=1;i<=NF;i++) if ($i!="/"){print $i}}' | sed 's/^[[:space:]]\+//;s/[[:space:]]\+$//' | sort -u)
 
-  # Déterminer le type par priorité : fastl4 > https (client-ssl) > http > other
-  vs_type="other"
-
-  # fastl4 ?
-  for p in "${ATTACHED[@]}"; do
-    if [[ -n "${SET_FASTL4["$p"]+x}" ]]; then vs_type="fastl4"; break; fi
+  # Résoudre noms courts -> chemins complets via inventaire
+  declare -a RESOLVED=()
+  for t in "${TOKENS[@]}"; do
+    if [[ "$t" == /*/* ]]; then
+      RESOLVED+=("$t")
+    else
+      # nom court ; on tente clientssl, tls-client, http, fastl4 (dans cet ordre)
+      if [[ -n "${NAME2_CLIENTSSL["$t"]-}" ]]; then RESOLVED+=("${NAME2_CLIENTSSL["$t"]}"); fi
+      if [[ -n "${NAME2_TLSCLIENT["$t"]-}"  ]]; then RESOLVED+=("${NAME2_TLSCLIENT["$t"]}");  fi
+      if [[ -n "${NAME2_HTTP["$t"]-}"       ]]; then RESOLVED+=("${NAME2_HTTP["$t"]}");       fi
+      if [[ -n "${NAME2_FASTL4["$t"]-}"     ]]; then RESOLVED+=("${NAME2_FASTL4["$t"]}");     fi
+      # si rien trouvé, on ignore (autres profils : oneconnect, tcp, http2, etc.)
+    fi
   done
 
-  # https (client-ssl) si pas déjà fastl4
+  # Détermination du type (priorité)
+  vs_type="other"
+  for p in "${RESOLVED[@]}"; do if [[ -n "${SET_FASTL4["$p"]+x}" ]]; then vs_type="fastl4"; break; fi; done
   if [[ "$vs_type" == "other" ]]; then
-    for p in "${ATTACHED[@]}"; do
-      if [[ -n "${SET_CLIENTSSL["$p"]+x}" ]]; then vs_type="https"; break; fi
+    for p in "${RESOLVED[@]}"; do
+      if [[ -n "${SET_CLIENTSSL["$p"]+x}" || -n "${SET_TLSCLIENT["$p"]+x}" ]]; then
+        vs_type="https"; break
+      fi
     done
   fi
-
-  # http si ni fastl4 ni https
   if [[ "$vs_type" == "other" ]]; then
-    for p in "${ATTACHED[@]}"; do
-      if [[ -n "${SET_HTTP["$p"]+x}" ]]; then vs_type="http"; break; fi
-    done
+    for p in "${RESOLVED[@]}"; do if [[ -n "${SET_HTTP["$p"]+x}" ]]; then vs_type="http"; break; fi; done
   fi
 
   printf "%-28s %-40s %-22s %-8s\n" "$part" "$vs_name" "${dest:-"-"}" "$vs_type"
+
+  if [[ $DEBUG -eq 1 ]]; then
+    echo "  -> profiles raw: ${prof_block:-"(none)"}"
+    echo "  -> tokens: ${TOKENS[*]:-"(none)"}"
+    echo "  -> resolved: ${RESOLVED[*]:-"(none)"}"
+    echo "  -> match: type=$vs_type"
+  fi
 done
