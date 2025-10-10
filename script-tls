@@ -10,20 +10,17 @@ TMP_MEMBERS=$(mktemp)
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/pool?expandSubcollections=true -o "$TMP_POOLS"
 
 # 2️⃣ Lister pools et leurs membres
-jq -r '.items? // [] | .[] | "\(.name) \(.membersReference.link // "")"' "$TMP_POOLS" > pools_list.txt
+jq -r '.items? // [] | .[] | "\(.name)"' "$TMP_POOLS" > pools_list.txt
 
 # Télécharger tous les pool members
-while read -r line; do
-    POOL_NAME=$(echo "$line" | awk '{print $1}')
-    LINK=$(echo "$line" | awk '{print $2}')
-    if [ -n "$LINK" ]; then
-        curl -sS --insecure -u admin: "http://localhost:8100$LINK" -o "$TMP_MEMBERS"
-        MEMBERS=$(jq -r '.items? // [] | .[].name' "$TMP_MEMBERS")
-        for M in $MEMBERS; do
-            echo "$POOL_NAME $M"
-        done
-    fi
-done < pools_list.txt > pool_members.txt
+> pool_members.txt
+while read -r POOL_NAME; do
+    curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/${POOL_NAME}/members" -o "$TMP_MEMBERS"
+    MEMBERS=$(jq -r '.items? // [] | .[].name' "$TMP_MEMBERS")
+    for M in $MEMBERS; do
+        echo "$POOL_NAME $M" >> pool_members.txt
+    done
+done < pools_list.txt
 
 echo "Pools et leurs membres récupérés via iControl REST :"
 cat pool_members.txt
