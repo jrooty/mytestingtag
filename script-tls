@@ -12,11 +12,12 @@ jq -r '.items? // [] | .[] | .name' "$TMP_POOLS" > pools_list.txt
 # 3️⃣ Récupérer la déclaration AS3
 curl -sS --insecure -u admin: http://localhost:8100/mgmt/shared/appsvcs/declare -o "$TMP_AS3"
 
-# 4️⃣ Extraire les noms des pools dans AS3 (clés JSON dont class == Pool)
+# 4️⃣ Extraire toutes les clés dont la valeur contient "class": "Pool"
 jq -r '
-  .. | objects
-  | to_entries? // empty
-  | .[] | select(.value.class == "Pool") | .key
+  paths | select(.[-1] == "class") as $p
+  | getpath($p[:-1]) as $obj
+  | select(getpath($p) == "Pool")
+  | $p[-2]
 ' "$TMP_AS3" | sort -u > as3_pools.txt
 
 echo "Matching pools iControl → AS3 :"
