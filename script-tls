@@ -28,7 +28,7 @@ colorize_status() {
 
 fetch_bigip_local_vs() {
     TMP_JSON=$(mktemp)
-    curl -sS -u admin: http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
+    curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
 
     TMP_MEMS=$(mktemp)
     if command -v jq >/dev/null 2>&1; then
@@ -43,32 +43,36 @@ fetch_bigip_local_vs() {
             PROFILES_LINK="${rest3%% *}"
             VS_TYPE="${rest3#* }"
 
-            # Filtrage selon mode
+            # Mode local: filtrage fastl4 + SSL/C3D
             if [ "$LOCAL_FULL" -eq 0 ]; then
                 [ "$VS_TYPE" = "fastl4" ] && continue
-            fi
 
-            # Vérifier SSL C3D si mode filtré seulement
-            if [ "$LOCAL_FULL" -eq 0 ] && [ "$PROFILES_LINK" != "null" ]; then
-                PROFILES_JSON=$(mktemp)
-                curl -sS -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
-                if ! jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
+                if [ "$PROFILES_LINK" != "null" ]; then
+                    PROFILES_JSON=$(mktemp)
+                    curl -sS --insecure -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
+                    if ! jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
+                        rm -f "$PROFILES_JSON"
+                        continue
+                    fi
                     rm -f "$PROFILES_JSON"
-                    continue
                 fi
-                rm -f "$PROFILES_JSON"
             fi
 
-            # Récupérer pool members si pool défini
-            if [ "$POOL" != "null" ]; then
-                POOL_JSON=$(mktemp)
-                curl -sS -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
-                mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
-                rm -f "$POOL_JSON"
-                for mem in "${MEMBERS[@]}"; do
-                    echo "$VS_NAME $mem" >> "$TMP_MEMS"
-                done
+            # VS sans pool
+            if [ "$POOL" = "null" ]; then
+                echo "[INFO] VS=$VS_NAME n'a pas de pool, aucun test TCP/TLS possible"
+                continue
             fi
+
+            # Récupérer pool members
+            POOL_JSON=$(mktemp)
+            curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
+            mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
+            rm -f "$POOL_JSON"
+
+            for mem in "${MEMBERS[@]}"; do
+                echo "$VS_NAME $mem" >> "$TMP_MEMS"
+            done
         done
     fi
     FILE="$TMP_MEMS"
