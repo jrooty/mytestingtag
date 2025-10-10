@@ -11,6 +11,7 @@ CLIENT_KEY=""
 CA_CERT=""
 FILE=""
 BIGIP_MODE=0
+LOCAL_FULL=0
 TMP_MEMS=""
 
 sleep_ms() { sleep "$(awk "BEGIN {printf \"%.3f\", $1/1000}")"; }
@@ -27,34 +28,42 @@ colorize_status() {
 
 fetch_bigip_local_vs() {
     TMP_JSON=$(mktemp)
-    curl -sS -k -u admin: https://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
+    curl -sS -u admin: http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
 
     TMP_MEMS=$(mktemp)
     if command -v jq >/dev/null 2>&1; then
-        # Parcours tous les VS
-        mapfile -t VS_LIST < <(jq -r '.items[] | select(.type!="fastl4") | "\(.name) \(.destination) \(.pool) \(.profilesReference.link)"' "$TMP_JSON")
+        mapfile -t VS_LIST < <(jq -r '.items[] | "\(.name) \(.destination) \(.pool) \(.profilesReference.link) \(.type)"' "$TMP_JSON")
         for vs in "${VS_LIST[@]}"; do
             VS_NAME="${vs%% *}"
             rest="${vs#* }"
             DEST="${rest%% *}"
             rest2="${rest#* }"
             POOL="${rest2%% *}"
-            PROFILES_LINK="${rest2#* }"
+            rest3="${rest2#* }"
+            PROFILES_LINK="${rest3%% *}"
+            VS_TYPE="${rest3#* }"
 
-            # Vérifier si VS a profile serverssl avec C3D activé
-            SSL_C3D_OK=0
-            PROFILES_JSON=$(mktemp)
-            curl -sS -k -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
-            if jq -e '.items[] | select(.context=="clientside" or .context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
-                SSL_C3D_OK=1
+            # Filtrage selon mode
+            if [ "$LOCAL_FULL" -eq 0 ]; then
+                [ "$VS_TYPE" = "fastl4" ] && continue
             fi
-            rm -f "$PROFILES_JSON"
 
-            # Si profile SSL avec C3D OK ou VS non-SSL, on récupère les members
-            if [[ "$SSL_C3D_OK" -eq 1 || "$POOL" != "null" ]]; then
-                # Extraire IP:PORT du pool members
+            # Vérifier SSL C3D si mode filtré
+            SSL_C3D_OK=0
+            if [ "$LOCAL_FULL" -eq 0 ] && [ "$PROFILES_LINK" != "null" ]; then
+                PROFILES_JSON=$(mktemp)
+                curl -sS -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
+                if jq -e '.items[] | select(.context=="serverssl") | select(.c3dEnabled==true)' "$PROFILES_JSON" >/dev/null; then
+                    SSL_C3D_OK=1
+                fi
+                rm -f "$PROFILES_JSON"
+                [ "$SSL_C3D_OK" -eq 0 ] && [ "$PROFILES_LINK" != "null" ] && continue
+            fi
+
+            # Récupérer pool members si pool défini
+            if [ "$POOL" != "null" ]; then
                 POOL_JSON=$(mktemp)
-                curl -sS -k -u admin: "https://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
+                curl -sS -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
                 mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
                 rm -f "$POOL_JSON"
                 for mem in "${MEMBERS[@]}"; do
@@ -135,7 +144,8 @@ check_target() {
 # ------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --local) BIGIP_MODE=1; shift ;;
+        --local) BIGIP_MODE=1; LOCAL_FULL=0; shift ;;
+        --local-full) BIGIP_MODE=1; LOCAL_FULL=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --sleep-ms) SLEEP_MS="$2"; shift 2 ;;
         --cert|--client-cert) CLIENT_CERT="$2"; shift 2 ;;
