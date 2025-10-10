@@ -6,44 +6,43 @@ F5_URL="http://localhost:8100"
 TMP_AS3=$(mktemp)
 TMP_POOLS=$(mktemp)
 
-# 1️⃣ Récupère les pools iControl
 echo "[INFO] Récupération des pools via iControl..."
 curl -sS --insecure -u "$F5_USER" "$F5_URL/mgmt/tm/ltm/pool" | jq -r '.items[].name' > "$TMP_POOLS"
 
-# 2️⃣ Récupère la déclaration AS3 complète
 echo "[INFO] Récupération de la déclaration AS3..."
 curl -sS --insecure -u "$F5_USER" "$F5_URL/mgmt/shared/appsvcs/declare" -o "$TMP_AS3"
 
-# 3️⃣ Corrélation entre pool iControl et AS3
 echo
 echo "=== Corrélation des pools ==="
 while read -r pool; do
-    # Recherche dans l’arborescence AS3 si le nom du pool est une clé
-    match=$(jq -r --arg POOL "$pool" '
-        paths
-        | select(.[-1] == $POOL)
-        | map(tostring)
-        | join(".")
-    ' "$TMP_AS3")
+    # Vérifie si la clé $pool existe quelque part dans la hiérarchie AS3
+    found=$(jq -r --arg POOL "$pool" '
+        def walk(f):
+            . as $in
+            | if type == "object" then reduce keys[] as $key ({}; . + { ($key): ($in[$key] | walk(f)) }) | f
+              elif type == "array" then map(walk(f)) | f
+              else f end;
+        walk(.) | select(has($POOL)) | $POOL
+    ' "$TMP_AS3" | head -n1)
 
-    if [ -n "$match" ]; then
-        # Vérifie si ce pool est référencé dans un VS
+    if [ -n "$found" ]; then
+        # Cherche un VS (Service_HTTPS / Service_L4) qui référence ce pool
         vs_name=$(jq -r --arg POOL "$pool" '
-            .. | objects | select(has("class"))
-            | select(.class | test("Service_"; "i"))
+            .. | objects
+            | select(has("class"))
+            | select(.class == "Service_HTTPS" or .class == "Service_L4")
             | select(.pool == $POOL)
             | .name // empty
-        ' "$TMP_AS3")
+        ' "$TMP_AS3" | head -n1)
 
         if [ -n "$vs_name" ]; then
-            echo "✅ Pool '$pool' trouvé dans AS3 → associé à VS '$vs_name'"
+            echo "✅ Pool '$pool' trouvé → VS associé : $vs_name"
         else
-            echo "⚠️  Pool '$pool' trouvé dans AS3 (aucun VS lié)"
+            echo "⚠️  Pool '$pool' trouvé dans AS3 (pas de VS lié)"
         fi
     else
         echo "❌ Pool '$pool' non trouvé dans la déclaration AS3"
     fi
 done < "$TMP_POOLS"
 
-# Nettoyage
 rm -f "$TMP_AS3" "$TMP_POOLS"
