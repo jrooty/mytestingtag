@@ -1,25 +1,25 @@
 #!/bin/bash
 #
-# Script de test de connectivité TCP / TLS / mTLS
+# Testeur de connectivité TCP / TLS / mTLS
 # Auteur : ChatGPT (GPT-5)
-# Version : finale + couleurs
+# Version : finale avec tableau coloré
 #
 # Usage :
-#   ./tls_tester.sh host port [--verbose]
-#   ./tls_tester.sh -f fichier_cibles.txt [--verbose]
+#   ./tls_tester_pretty.sh host port [--verbose]
+#   ./tls_tester_pretty.sh -f fichier_cibles.txt [--verbose]
 #
-# Format du fichier :
-#   host port
-#   host2 port2
+# Fichier d'entrée (exemple) :
+#   example.com 443
+#   myserver.local 8443
 #
 
 # ------------------------------
-# Variables configurables
+# Configuration
 # ------------------------------
 CLIENT_CERT=""
 CLIENT_KEY=""
 CA_FILE=""
-SLEEP_BETWEEN_TESTS_MS=200   # Délai entre tests multiples (en millisecondes)
+SLEEP_BETWEEN_TESTS_MS=200
 TIMEOUT=5
 VERBOSE=0
 
@@ -44,7 +44,7 @@ usage() {
   echo "  --ca=FILE            CA pour la vérification TLS"
   echo "  --sleep-ms=NUM       Délai entre tests (ms, défaut 200)"
   echo "  --timeout=NUM        Timeout en secondes (défaut 5)"
-  echo "  --verbose            Mode verbeux"
+  echo "  --verbose            Mode verbeux (détails handshake)"
   exit 1
 }
 
@@ -106,28 +106,28 @@ test_server() {
     rm -f "$TMP_MTLS"
   fi
 
-  # --- Préfixe ---
-  local PREFIX=""
-  if [ "$TCP_STATUS" != "OK" ] || [ "$TLS_STATUS" != "OK" ] || [ "$MTLS_STATUS" = "FAIL" ]; then
-    PREFIX="[${RED}ERR${NC}] "
-  elif [ "$MTLS_STATUS" = "REQ" ]; then
-    PREFIX="[${YELLOW}WARN${NC}] "
-  fi
-
-  # --- Affichage ---
+  # --- Résultat coloré et préfixe ---
   local TCP_C=$(colorize_status "$TCP_STATUS")
   local TLS_C=$(colorize_status "$TLS_STATUS")
   local MTLS_C=$(colorize_status "$MTLS_STATUS")
+  local PREFIX=""
+  if [ "$TCP_STATUS" != "OK" ] || [ "$TLS_STATUS" != "OK" ] || [ "$MTLS_STATUS" = "FAIL" ]; then
+    PREFIX="[${RED}ERR${NC}]"
+  elif [ "$MTLS_STATUS" = "REQ" ]; then
+    PREFIX="[${YELLOW}WARN${NC}]"
+  else
+    PREFIX="[${GREEN}OK${NC}]"
+  fi
 
   if [ "$VERBOSE" -eq 1 ]; then
-    echo -e "===== Test de ${YELLOW}${HOST}:${PORT}${NC} (${IP}) ====="
+    echo -e "===== ${YELLOW}${HOST}:${PORT}${NC} (${IP}) ====="
     echo -e "TCP : $TCP_C"
     echo -e "TLS : $TLS_C"
     echo -e "mTLS : $MTLS_C"
-    echo -e "${PREFIX}Résultat synthétique : TCP=${TCP_C} TLS=${TLS_C} mTLS=${MTLS_C}"
-    echo -e "--------------------------------------"
+    echo -e "Résultat : $PREFIX"
+    echo "--------------------------------------"
   else
-    echo -e "${PREFIX}${HOST}:${PORT} (${IP}) TCP=${TCP_C} TLS=${TLS_C} mTLS=${MTLS_C}"
+    printf "%-40s %-15s %-15s %-15s %s\n" "${HOST}:${PORT} (${IP})" "$TCP_C" "$TLS_C" "$MTLS_C" "$PREFIX"
   fi
 
   rm -f "$TMP_OUT"
@@ -149,7 +149,7 @@ else
   shift 2
 fi
 
-# Options supplémentaires
+# Options
 while [ $# -gt 0 ]; do
   case "$1" in
     --verbose) VERBOSE=1 ;;
@@ -162,6 +162,14 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# ------------------------------
+# En-tête du tableau (mode condensé)
+# ------------------------------
+if [ "$VERBOSE" -eq 0 ]; then
+  printf "%-40s %-15s %-15s %-15s %s\n" "Serveur" "TCP" "TLS" "mTLS" "Résultat"
+  echo "-----------------------------------------------------------------------------------------------------"
+fi
 
 # ------------------------------
 # Exécution
