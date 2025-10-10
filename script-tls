@@ -26,27 +26,31 @@ colorize_status() {
     esac
 }
 
+# ------------------------------
+# Récupération des VS et pools (directs + LTP)
+# ------------------------------
 fetch_bigip_local_vs() {
     TMP_JSON=$(mktemp)
     curl -sS --insecure -u admin: http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true -o "$TMP_JSON" || { echo "Erreur curl"; rm -f "$TMP_JSON"; exit 1; }
 
     TMP_MEMS=$(mktemp)
     if command -v jq >/dev/null 2>&1; then
-        mapfile -t VS_LIST < <(jq -r '.items[] | "\(.name) \(.destination) \(.pool) \(.profilesReference.link) \(.type)"' "$TMP_JSON")
+        mapfile -t VS_LIST < <(jq -r '.items[] | "\(.name) \(.destination) \(.pool) \(.profilesReference.link) \(.type) \(.policiesReference.link)"' "$TMP_JSON")
         for vs in "${VS_LIST[@]}"; do
             VS_NAME="${vs%% *}"
             rest="${vs#* }"
             DEST="${rest%% *}"
             rest2="${rest#* }"
-            POOL="${rest2%% *}"
+            POOL_DIRECT="${rest2%% *}"
             rest3="${rest2#* }"
             PROFILES_LINK="${rest3%% *}"
-            VS_TYPE="${rest3#* }"
+            rest4="${rest3#* }"
+            VS_TYPE="${rest4%% *}"
+            POLICIES_LINK="${rest4#* }"
 
             # Mode local: filtrage fastl4 + SSL/C3D
             if [ "$LOCAL_FULL" -eq 0 ]; then
                 [ "$VS_TYPE" = "fastl4" ] && continue
-
                 if [ "$PROFILES_LINK" != "null" ]; then
                     PROFILES_JSON=$(mktemp)
                     curl -sS --insecure -u admin: "$PROFILES_LINK" -o "$PROFILES_JSON"
@@ -58,26 +62,51 @@ fetch_bigip_local_vs() {
                 fi
             fi
 
-            # VS sans pool
-            if [ "$POOL" = "null" ]; then
-                echo "[INFO] VS=$VS_NAME n'a pas de pool, aucun test TCP/TLS possible"
+            # Collecte pools: direct
+            POOLS=()
+            [ "$POOL_DIRECT" != "null" ] && POOLS+=("$POOL_DIRECT")
+
+            # Collecte pools: via LTP
+            if [ "$POLICIES_LINK" != "null" ]; then
+                POL_JSON=$(mktemp)
+                curl -sS --insecure -u admin: "$POLICIES_LINK" -o "$POL_JSON"
+                mapfile -t POLICY_ITEMS < <(jq -r '.items[]?.name' "$POL_JSON")
+                rm -f "$POL_JSON"
+
+                for pol in "${POLICY_ITEMS[@]}"; do
+                    RULES_JSON=$(mktemp)
+                    curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/policy/$pol/rules" -o "$RULES_JSON"
+                    # Extraction pools dans actions 'forward' ou 'select pool'
+                    mapfile -t RULE_POOLS < <(jq -r '.items[]?.actions[]? | select(.forward && .forward.pool) | .forward.pool' "$RULES_JSON")
+                    POOLS+=("${RULE_POOLS[@]}")
+                    rm -f "$RULES_JSON"
+                done
+            fi
+
+            # Si pas de pool, log info
+            if [ "${#POOLS[@]}" -eq 0 ]; then
+                echo "[INFO] VS=$VS_NAME n'a pas de pool, aucun test TCP/TLS"
                 continue
             fi
 
-            # Récupérer pool members
-            POOL_JSON=$(mktemp)
-            curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$POOL/members?expandSubcollections=true" -o "$POOL_JSON"
-            mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
-            rm -f "$POOL_JSON"
-
-            for mem in "${MEMBERS[@]}"; do
-                echo "$VS_NAME $mem" >> "$TMP_MEMS"
+            # Récupérer tous les pool members
+            for pool in "${POOLS[@]}"; do
+                POOL_JSON=$(mktemp)
+                curl -sS --insecure -u admin: "http://localhost:8100/mgmt/tm/ltm/pool/$pool/members?expandSubcollections=true" -o "$POOL_JSON"
+                mapfile -t MEMBERS < <(jq -r '.items[]?.name' "$POOL_JSON")
+                rm -f "$POOL_JSON"
+                for mem in "${MEMBERS[@]}"; do
+                    echo "$VS_NAME $mem" >> "$TMP_MEMS"
+                done
             done
         done
     fi
     FILE="$TMP_MEMS"
 }
 
+# ------------------------------
+# Test TCP/TLS/mTLS
+# ------------------------------
 check_target() {
     local VSNAME="$1"
     local HOST="$2"
