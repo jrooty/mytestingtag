@@ -1,11 +1,11 @@
 #!/bin/bash
-# Audit des VS avec C3D activé → liste les pools + pool members (même partition)
+# Audit des VS avec C3D activé → liste les pools + pool members (IP:port)
 # Compatible jq minimal (F5)
 # HTTP 8100, admin:
 # Un seul appel expandSubcollections pour VS et Pools
 # Options :
 #   --debug      → logs détaillés
-#   --c3d-only   → ne liste que les VS avec C3D=ON
+#   --c3d-only   → n'affiche que les VS avec C3D=ON
 
 set -euo pipefail
 
@@ -36,10 +36,10 @@ curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 echo "[INFO] Lecture des Pools et de leurs membres..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-printf "\n%-25s %-40s %-35s %-8s %-40s\n" \
-  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_MEMBERS"
+printf "\n%-25s %-40s %-35s %-8s %-60s\n" \
+  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_MEMBERS (IP:PORT)"
 printf "%s\n" \
-  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 # Boucle sur les VS
 jq -r '
@@ -107,7 +107,17 @@ jq -r '
     [ -z "$pool_row" ] && continue
     _p() { echo "$pool_row" | base64 --decode | jq -r "$1"; }
     pool_name=$(_p '.pool')
-    members=$(_p '.members | map(.name) | join(" ")')
+
+    # Construction IP:port (fallback sur name)
+    members=$(_p '.members | map(
+      if (.address != null and .address != "")
+        then (.address + ":" + (.port|tostring))
+        elif (.addr != null and .addr != "")
+        then (.addr + ":" + (.port|tostring))
+        else .name
+      end
+    ) | join(" ")')
+
     if [ -z "$members" ]; then
       members="(aucun membre)"
     fi
@@ -117,7 +127,7 @@ jq -r '
   [ -z "$pool_members_display" ] && pool_members_display="(aucun pool)"
   pool_members_display=$(echo "$pool_members_display" | sed 's/ *$//')
 
-  printf "%-25s %-40s %-35s %-8s %-40s\n" \
+  printf "%-25s %-40s %-35s %-8s %-60s\n" \
     "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pool_members_display"
 
 done
