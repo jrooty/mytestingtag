@@ -1,21 +1,88 @@
-#!/bin/bash
-IPPORT="$1"
-SNI="$2"
-[[ -z "$SNI" ]] && SNI="${IPPORT%%:*}"
+# =========================
+# MODE DIRECT --target (corrigé OpenSSL 1.0.2)
+# =========================
+if [[ -n "$TARGET" ]]; then
+  IP="${TARGET%%:*}"
+  PORT="${TARGET##*:}"
+  [[ -z "$SNI" ]] && SNI="$IP"
 
-TMP=$(mktemp)
-CERT=$(mktemp)
-trap 'rm -f "$TMP" "$CERT"' EXIT
+  echo "[INFO] Mode direct --target : ${IP}:${PORT}"
+  echo
 
-echo "[INFO] Connexion à $IPPORT (SNI=$SNI)"
-openssl s_client -connect "$IPPORT" -servername "$SNI" -showcerts </dev/null >"$TMP" 2>&1
+  tcp_res="KO"; tls_res="KO"; mtls_res="KO"
 
-awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" > "$CERT"
+  # Test TCP
+  if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
+    tcp_res="OK"
 
-if grep -q "BEGIN CERTIFICATE" "$CERT"; then
-  echo "[INFO] Détails certificat serveur :"
-  openssl x509 -in "$CERT" -noout \
-    -subject -issuer -dates -fingerprint -sha256 2>/dev/null | sed 's/^/  /'
-else
-  echo "[ERREUR] Aucun certificat extrait."
+    # Test TLS simple
+    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
+        | grep -q "BEGIN CERTIFICATE"; then
+      tls_res="OK"
+    fi
+
+    # Test mTLS si matériel présent
+    if (( USE_MTLS )); then
+      if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
+           -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 \
+           | grep -q "BEGIN CERTIFICATE"; then
+        mtls_res="OK"
+      else
+        mtls_res="REQ"
+      fi
+    fi
+  fi
+
+  GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
+  [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
+  [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
+  case "$mtls_res" in
+    OK) mtls_col="${GREEN}OK${RESET}" ;;
+    REQ) mtls_col="${YELLOW}REQ${RESET}" ;;
+    *) mtls_col="${RED}KO${RESET}" ;;
+  esac
+
+  echo -e "${BOLD}Cible:${RESET} ${IP}:${PORT}   ${BOLD}SNI:${RESET} ${SNI}"
+  echo -e "${BOLD}Résultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
+  echo
+
+  # ----- Détails certificat serveur -----
+  if [[ "$tls_res" == "OK" ]]; then
+    echo "[INFO] Détails certificat serveur :"
+    TMP_CERT=$(mktemp)
+    openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null 2>&1 \
+      | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
+      | tr -d '\r' > "$TMP_CERT"
+    if [[ -s "$TMP_CERT" ]]; then
+      openssl x509 -in "$TMP_CERT" -noout \
+        -subject -issuer -dates -fingerprint -sha256 2>/dev/null \
+        | sed 's/^/  /'
+    else
+      echo "  (aucun certificat extrait)"
+    fi
+    rm -f "$TMP_CERT"
+    echo
+  fi
+
+  # ----- CA acceptées par le serveur -----
+  echo "[INFO] CA acceptées par le serveur (si fournies) :"
+  openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" </dev/null 2>&1 \
+    | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
+  echo
+
+  # ----- Infos locales mTLS -----
+  if (( USE_MTLS )); then
+    echo "[INFO] Matériel client mTLS local :"
+    subj_client=$(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_client=$(openssl x509 -in "$CLIENT_CERT" -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
+    subj_ca=$(openssl x509 -in "$CA_FILE"     -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_ca=$(openssl x509 -in "$CA_FILE"      -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
+    echo "  Client cert (subject): ${subj_client}"
+    echo "  Client cert (issuer) : ${iss_client}"
+    echo "  CA locale (subject)  : ${subj_ca}"
+    echo "  CA locale (issuer)   : ${iss_ca}"
+    echo
+  fi
+
+  exit 0
 fi
