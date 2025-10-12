@@ -1,6 +1,6 @@
 #!/bin/bash
-# Audit complet VS C3D + test TCP / TLS / mTLS sur les pool members
-# Version : inchangée (structure d'origine) + comptage au début et à la fin
+# Audit complet VS + test TCP / TLS / mTLS sur les pool members
+# Version stable confirmée : liste totale VS + VS avec profil server-ssl
 
 set -euo pipefail
 
@@ -12,9 +12,6 @@ for arg in "$@"; do
     --c3d-only) FILTER_C3D_ONLY=1 ;;
   esac
 done
-
-# Couleurs pour l'affichage final
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
 
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
@@ -33,25 +30,18 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
-# ---- Comptage global avant exécution principale ----
-curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS" >/dev/null 2>&1 || true
+# ---- Préparation comptage ----
+curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 total_vs=$(jq -r '.items | length' "$TMP_VS" 2>/dev/null || echo 0)
-total_c3d_on=0
-for link in $(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null || true); do
-  if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-    [[ "$link" == http* ]] || link="$BASE$link"
-    link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
-    curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
-    sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-    [[ "${sslC3d,,}" == "enabled" ]] && ((total_c3d_on++))
-  fi
-done
-echo -e "\n[INFO] Nombre total de Virtual Servers détectés : ${total_vs}"
-echo -e "[INFO] Nombre de Virtual Servers avec C3D activé : ${total_c3d_on}\n"
+total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null \
+  | grep -c "ltm/profile/server-ssl/" || true)
 
-# ---- Script d'origine (aucune modif de structure) ----
+echo -e "\n[INFO] Nombre total de Virtual Servers : ${total_vs}"
+echo -e "[INFO] Nombre de Virtual Servers avec profil server-ssl : ${total_ssl}\n"
+
+# ---- Script principal inchangé ----
 {
-curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL" >/dev/null 2>&1 || true
+curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
 jq -r '
   .items[]? |
@@ -64,13 +54,11 @@ jq -r '
   _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
-  vs_pool=$(_jq '.pool')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
   c3d_status="OFF"
-
   profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
 
@@ -109,7 +97,6 @@ jq -r '
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       [ -z "$ip" ] && continue
       tcp_res="KO"; tls_res="KO"; mtls_res="KO"
-
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
         if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
@@ -130,12 +117,11 @@ done
 } | awk '
 BEGIN {
   red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
-  vsnum=0; c3d_on=0
+  vsnum=0
 }
-# Détection VS
+# VS
 /^#VS#/ {
   vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
-  if (c3d=="ON") c3d_on++;
   printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
   next
 }
@@ -149,8 +135,4 @@ BEGIN {
   else mtls=red mtls reset;
   printf("    %s:%s   TCP=%s   TLS=%s   mTLS=%s\n", ip, port, tcp, tls, mtls);
 }
-END {
-  printf "\n[INFO] Nombre total de Virtual Servers audités : %d\n", vsnum;
-  printf "[INFO] Nombre de VS avec C3D activé : %d\n", c3d_on;
-  print  "\n[INFO] Audit complet terminé."
-}'
+END { print "\n[INFO] Audit complet terminé." }'
