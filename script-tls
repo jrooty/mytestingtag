@@ -1,8 +1,7 @@
 #!/bin/bash
 # Audit des VS avec C3D activé → liste les pools + pool members (IP:port)
-# Compatible jq minimal (F5)
 # HTTP 8100, admin:
-# Un seul appel expandSubcollections pour VS et Pools
+# Compatible jq minimal F5
 # Options :
 #   --debug      → logs détaillés
 #   --c3d-only   → n'affiche que les VS avec C3D=ON
@@ -36,12 +35,11 @@ curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 echo "[INFO] Lecture des Pools et de leurs membres..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-printf "\n%-25s %-40s %-35s %-8s %-60s\n" \
+printf "\n%-25s %-40s %-35s %-8s %-80s\n" \
   "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_MEMBERS (IP:PORT)"
 printf "%s\n" \
-  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
-# Boucle sur les VS
 jq -r '
   .items[]? |
   {
@@ -63,7 +61,7 @@ jq -r '
   profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
 
-  # Recherche du profil server-ssl → lecture directe pour sslC3d
+  # Recherche du profil server-ssl
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name")
@@ -71,7 +69,6 @@ jq -r '
 
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-        # Conversion du lien pour HTTP local
         if [[ "$link" == http* ]]; then
           link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
         else
@@ -89,12 +86,12 @@ jq -r '
     done
   fi
 
-  # Filtrage si --c3d-only activé
+  # Filtrage si --c3d-only
   if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
 
-  # Recherche des pools dans la même partition + leurs membres
+  # Recherche pools même partition + membres IP:PORT
   pools_json=$(jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
@@ -108,13 +105,20 @@ jq -r '
     _p() { echo "$pool_row" | base64 --decode | jq -r "$1"; }
     pool_name=$(_p '.pool')
 
-    # Construction IP:port (fallback sur name)
+    # Extraction IP:PORT robuste
     members=$(_p '.members | map(
-      if (.address != null and .address != "")
-        then (.address + ":" + (.port|tostring))
-        elif (.addr != null and .addr != "")
-        then (.addr + ":" + (.port|tostring))
-        else .name
+      if (.address != null and .address != "") then
+         (.address + ":" +
+           (if (.port != null and .port != 0) then (.port|tostring)
+            else (if (.name|test(":")) then (.name|split(":")[1]) else "unknown" end)
+            end))
+      elif (.addr != null and .addr != "") then
+         (.addr + ":" +
+           (if (.port != null and .port != 0) then (.port|tostring)
+            else (if (.name|test(":")) then (.name|split(":")[1]) else "unknown" end)
+            end))
+      elif (.name|test(":")) then .name
+      else .name + ":unknown"
       end
     ) | join(" ")')
 
@@ -127,9 +131,8 @@ jq -r '
   [ -z "$pool_members_display" ] && pool_members_display="(aucun pool)"
   pool_members_display=$(echo "$pool_members_display" | sed 's/ *$//')
 
-  printf "%-25s %-40s %-35s %-8s %-60s\n" \
+  printf "%-25s %-40s %-35s %-8s %-80s\n" \
     "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pool_members_display"
-
 done
 
 echo -e "\n[INFO] Audit terminé."
