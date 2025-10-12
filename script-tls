@@ -1,5 +1,5 @@
 # =========================
-# MODE DIRECT --target (corrigé OpenSSL 1.0.2)
+# MODE DIRECT --target (stable OpenSSL 1.0.2)
 # =========================
 if [[ -n "$TARGET" ]]; then
   IP="${TARGET%%:*}"
@@ -11,17 +11,17 @@ if [[ -n "$TARGET" ]]; then
 
   tcp_res="KO"; tls_res="KO"; mtls_res="KO"
 
-  # Test TCP
+  # --- Test TCP ---
   if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
     tcp_res="OK"
 
-    # Test TLS simple
+    # --- Test TLS simple ---
     if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
-        | grep -q "BEGIN CERTIFICATE"; then
+         | grep -q "BEGIN CERTIFICATE"; then
       tls_res="OK"
     fi
 
-    # Test mTLS si matériel présent
+    # --- Test mTLS si matériel présent ---
     if (( USE_MTLS )); then
       if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
            -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 \
@@ -33,6 +33,7 @@ if [[ -n "$TARGET" ]]; then
     fi
   fi
 
+  # --- Affichage des résultats ---
   GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
   [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
   [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
@@ -46,31 +47,34 @@ if [[ -n "$TARGET" ]]; then
   echo -e "${BOLD}Résultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
   echo
 
-  # ----- Détails certificat serveur -----
+  # --- Détails certificat serveur ---
   if [[ "$tls_res" == "OK" ]]; then
     echo "[INFO] Détails certificat serveur :"
     TMP_CERT=$(mktemp)
+    trap 'rm -f "$TMP_CERT"' EXIT
+
     openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null 2>&1 \
       | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
       | tr -d '\r' > "$TMP_CERT"
-    if [[ -s "$TMP_CERT" ]]; then
+
+    if grep -q "BEGIN CERTIFICATE" "$TMP_CERT"; then
+      echo "  (certificat reçu : $(wc -l < "$TMP_CERT") lignes)"
       openssl x509 -in "$TMP_CERT" -noout \
         -subject -issuer -dates -fingerprint -sha256 2>/dev/null \
         | sed 's/^/  /'
     else
-      echo "  (aucun certificat extrait)"
+      echo "  (aucun certificat trouvé dans le flux TLS)"
     fi
-    rm -f "$TMP_CERT"
     echo
   fi
 
-  # ----- CA acceptées par le serveur -----
+  # --- CA acceptées par le serveur ---
   echo "[INFO] CA acceptées par le serveur (si fournies) :"
   openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" </dev/null 2>&1 \
     | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
   echo
 
-  # ----- Infos locales mTLS -----
+  # --- Infos locales mTLS ---
   if (( USE_MTLS )); then
     echo "[INFO] Matériel client mTLS local :"
     subj_client=$(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')
