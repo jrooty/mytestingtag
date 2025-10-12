@@ -1,7 +1,7 @@
 #!/bin/bash
-# Audit complet des Virtual Servers (HTTP 8100, admin:)
-# Un seul appel principal (expandSubcollections=true)
-# + suivi des liens "nameReference.link" pour profils server-ssl (optimisé)
+# Audit des Virtual Servers BIG-IP (local HTTP 8100)
+# Détection des profils server-ssl et du statut C3D
+# Un appel principal expandSubcollections + suivi des liens HTTP:8100
 # Compatible jq sans regex, option --debug
 
 set -euo pipefail
@@ -9,16 +9,20 @@ set -euo pipefail
 DEBUG=0
 [[ "${1:-}" == "--debug" ]] && DEBUG=1
 
-F5_BASE="http://localhost:8100"
+# --- paramètres F5 locaux ---
+F5_HOST="localhost:8100"
+F5_BASE="http://$F5_HOST"
 F5_URL="$F5_BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
 AUTH="admin:"
+
 TMP_VS=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-echo "[INFO] Lecture des Virtual Servers (expandSubcollections=true)..."
+echo "[INFO] Lecture des Virtual Servers sur $F5_HOST ..."
 curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
 
+# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
   echo "[ERR] Réponse non JSON. Extrait :"
   head -n 20 "$TMP_VS"
@@ -28,6 +32,7 @@ fi
 printf "\n%-25s %-40s %-35s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 printf "%s\n" "──────────────────────────────────────────────────────────────────────────────────────────────"
 
+# Boucle sur les VS
 jq -r '
   .items[]? |
   {
@@ -58,17 +63,24 @@ jq -r '
       ctx=$(echo "$profiles_json" | jq -r ".[$idx].context // empty")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
 
-      # Détection d’un profil server-ssl
+      # Détection profil server-ssl
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-        [[ "$link" != http* ]] && link="$F5_BASE$link"  # s'assurer que le lien est complet
+
+        # Construction du lien HTTP 8100 si incomplet
+        if [[ "$link" != http* ]]; then
+          link="$F5_BASE$link"
+        else
+          # remplace https://localhost par http://localhost:8100 si besoin
+          link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
+        fi
 
         if (( DEBUG )); then
           echo "[DEBUG] -> Profil server-ssl trouvé : $ssl_name (context=$ctx)"
-          echo "[DEBUG] -> Lien complet : $link"
+          echo "[DEBUG] -> Lien HTTP suivi : $link"
         fi
 
-        # Lecture du profil SSL via son lien dédié
+        # Lecture du profil SSL
         curl -sS --insecure -u "$AUTH" "$link" -o "$TMP_SSL" 2>/dev/null || continue
 
         # Vérifie les champs C3D
@@ -87,7 +99,6 @@ jq -r '
           jq -r '{clientCertCA, c3dCA, c3dCaCerts, c3d}' <"$TMP_SSL"
           echo "[DEBUG] -> Statut C3D : $c3d_status"
         fi
-
         break
       fi
     done
@@ -96,4 +107,4 @@ jq -r '
   printf "%-25s %-40s %-35s %-8s\n" "$part" "$vs_name" "$ssl_name" "$c3d_status"
 done
 
-echo -e "\n[INFO] Audit terminé."
+echo -e "\n[INFO] Audit terminé sur $F5_HOST."
