@@ -1,116 +1,104 @@
 #!/bin/bash
-# Audit VS BIG-IP (HTTP 8100, admin:)
-# - Un seul GET principal avec expandSubcollections=true
-# - Suivi des liens "server-ssl" (nameReference.link) seulement
-# - Réécriture des URLs en http://localhost:8100/...
-# - Affiche le code HTTP des appels profil
-# - C3D détecté via le champ "sslC3d" uniquement
-# - Mode --debug pour voir les liens suivis
+# Audit des Virtual Servers avec C3D actif et leurs pools dans la même partition
+# 1 appel expandSubcollections pour les VS
+# 1 appel expandSubcollections pour les pools
+# HTTP (port 8100), admin:, compatible jq sans regex
+# Option --debug pour inspection détaillée
 
 set -euo pipefail
 
 DEBUG=0
 [[ "${1:-}" == "--debug" ]] && DEBUG=1
 
+# --- Connexion locale F5 ---
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
-AUTH="admin:"                           # user:pass (pass vide)
+AUTH="admin:"
+
 VS_URL="$BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
+POOL_URL="$BASE/mgmt/tm/ltm/pool?expandSubcollections=true"
 
-TMP_VS="$(mktemp)"
-TMP_SSL="$(mktemp)"
-trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
+TMP_VS=$(mktemp)
+TMP_POOL=$(mktemp)
+trap 'rm -f "$TMP_VS" "$TMP_POOL"' EXIT
 
-echo "[INFO] GET $VS_URL"
+echo "[INFO] Lecture des Virtual Servers..."
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 
-# Vérif JSON
+echo "[INFO] Lecture des Pools..."
+curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
+
+# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non JSON. Extrait :" >&2
-  head -n 40 "$TMP_VS" >&2
+  echo "[ERR] Réponse VS non JSON. Extrait :"
+  head -n 20 "$TMP_VS"
+  exit 1
+fi
+if ! jq -e . >/dev/null 2>&1 <"$TMP_POOL"; then
+  echo "[ERR] Réponse Pools non JSON. Extrait :"
+  head -n 20 "$TMP_POOL"
   exit 1
 fi
 
-printf "\n%-25s %-40s %-35s %-6s %-3s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "HTTP"
-printf "%s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────"
+printf "\n%-25s %-40s %-35s %-8s %-40s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_ASSOCIÉS"
+printf "%s\n" "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
-# Boucle VS
+# --- Boucle sur tous les VS ---
 jq -r '
   .items[]? |
   {
     vs: .fullPath,
+    pool: .pool // "-",
     profiles: (.profilesReference.items // [])
   } | @base64
 ' "$TMP_VS" | while read -r row; do
   _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
+  vs_pool=$(_jq '.pool')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
-  c3d="-"           # ON/OFF/-
-  http_code="-"     # code HTTP du GET profil
+  c3d_status="OFF"
 
   profiles_json=$(_jq '.profiles')
 
-  (( DEBUG )) && {
-    echo -e "\n[DEBUG] VS: $vs_path"
-    echo "$profiles_json" | jq -r '.[]?.name'
-  }
-
+  # Recherche du profil server-ssl
   count=$(echo "$profiles_json" | jq 'length')
   if [ "$count" -gt 0 ]; then
-    for idx in $(seq 0 $((count-1))); do
+    for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name // empty")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
-      # On ne s'intéresse qu'aux profils server-ssl
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-
-        # Uniformiser lien en HTTP:8100 local
-        if [[ "$link" == http* ]]; then
-          # remplacer https://localhost (ou http://localhost) par http://localhost:8100
-          link=$(echo "$link" | sed -e 's#https://localhost#http://localhost:8100#g' \
-                                    -e 's#http://localhost$#http://localhost:8100#g' \
-                                    -e 's#http://localhost/#http://localhost:8100/#g')
-        else
-          link="$BASE${link}"
-        fi
-
-        (( DEBUG )) && {
-          echo "[DEBUG] -> server-ssl: $ssl_name"
-          echo "[DEBUG] -> GET profil : $link"
-        }
-
-        # GET du profil et capture code HTTP
-        http_code=$(curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" -w "%{http_code}" "$link" || echo "000")
-
-        # Par défaut OFF si appel ok ; sinon reste "-"
-        c3d="-"
-        if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
-          # Détection C3D via sslC3d uniquement
-          # ON si sslC3d existe et != "disabled"/"none" (insensible casse côté bash)
-          raw=$(jq -r '.sslC3d // ""' <"$TMP_SSL")
-          lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
-          if [[ -n "$raw" && "$lower" != "disabled" && "$lower" != "none" ]]; then
-            c3d="ON"
-          else
-            c3d="OFF"
-          fi
-          (( DEBUG )) && {
-            echo "[DEBUG] -> sslC3d: ${raw:-"(absent)"}"
-            echo "[DEBUG] -> C3D: $c3d   HTTP: $http_code"
-          }
-        else
-          (( DEBUG )) && echo "[DEBUG] -> Appel profil NON 2xx (HTTP=$http_code)"
+        # Lire le champ sslC3d directement s'il est présent dans expandSubcollections
+        raw=$(echo "$profiles_json" | jq -r ".[$idx].sslC3d // empty")
+        lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+        if [[ -n "$raw" && "$lower" != "disabled" && "$lower" != "none" ]]; then
+          c3d_status="ON"
         fi
         break
       fi
     done
   fi
 
-  printf "%-25s %-40s %-35s %-6s %-3s\n" "$part" "$vs_name" "$ssl_name" "$c3d" "$http_code"
+  # Si C3D activé → recherche des pools de la même partition
+  pools_in_part="-"
+  if [ "$c3d_status" = "ON" ]; then
+    pools_in_part=$(jq -r --arg part "$part" '
+      .items[]? | select(.fullPath | startswith("/" + $part + "/")) | .name
+    ' "$TMP_POOL" | xargs)
+    [ -z "$pools_in_part" ] && pools_in_part="(aucun)"
+  fi
+
+  printf "%-25s %-40s %-35s %-8s %-40s\n" \
+    "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pools_in_part"
+
+  if (( DEBUG )); then
+    echo "[DEBUG] VS=$vs_path pool=$vs_pool ssl=$ssl_name C3D=$c3d_status"
+    echo "[DEBUG] Pools mêmes partition: $pools_in_part"
+  fi
 done
 
-echo -e "\n[INFO] Terminé."
+echo -e "\n[INFO] Audit terminé."
