@@ -1,67 +1,62 @@
 #!/bin/bash
-# Liste tous les Virtual Servers (de toutes partitions visibles)
-# et détecte les profils server-ssl attachés + C3D activé
-# via iControl REST local (HTTP 8100) avec admin: sans mot de passe
+# Audit des Virtual Servers avec expandSubcollections=true
+# Détecte profils server-ssl + C3D actif, via un SEUL appel iControl REST.
+# Connexion locale (HTTP 8100), admin: sans mot de passe.
 
 set -euo pipefail
 
-F5_URL="http://localhost:8100"
+F5_URL="http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true"
 AUTH="admin:"
 TMP_VS=$(mktemp)
-TMP_SSL=$(mktemp)
-trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
+trap 'rm -f "$TMP_VS"' EXIT
 
-echo "[INFO] Lecture des Virtual Servers..."
-curl -sS --insecure -u "$AUTH" "$F5_URL/mgmt/tm/ltm/virtual" -o "$TMP_VS"
+echo "[INFO] Récupération de la liste complète des VS (expandSubcollections=true)..."
+curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
 
-# Vérifie que c'est bien du JSON
+# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non JSON, extrait :"
+  echo "[ERR] Réponse non valide JSON, extrait :"
   head -n 20 "$TMP_VS"
   exit 1
 fi
 
 printf "%-25s %-40s %-35s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 
-# Boucle sur chaque VS (même sans profils)
 jq -r '
   .items[]? |
   {
     vs: .fullPath,
-    links: (.profilesReference.items // [] | map(.nameReference.link) | join(" "))
+    profiles: (.profilesReference.items // [] |
+                map(select(.context == "serverside" and (.name | test("server-ssl";"i"))))
+               )
   } | @base64
 ' "$TMP_VS" | while read -r vs_enc; do
-
   _jq() { echo "$vs_enc" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
-  links=$(_jq '.links')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  ssl_profile="-"
+  # Profil serveur SSL (si présent)
+  ssl_name=$(_jq '.profiles[0].name // "-"')
   c3d_status="-"
 
-  # Parcourir tous les profils liés
-  for link in $links; do
-    if [[ "$link" == *"/mgmt/tm/ltm/profile/server-ssl/"* ]]; then
-      # Ex: /mgmt/tm/ltm/profile/server-ssl/~Common~PrfCSSL_app
-      ssl_profile="${link##*/}"
+  if [[ "$ssl_name" != "-" ]]; then
+    # Cherche les attributs C3D directement dans le JSON expandu
+    c3d_status=$(jq -r --arg VS "$vs_path" '
+      .items[]
+      | select(.fullPath == $VS)
+      | .profilesReference.items[]
+      | select(.context == "serverside" and (.name | test("server-ssl";"i")))
+      | if ((.clientCertCA? // "") != "none" and .clientCertCA != null)
+          or ((.c3dCA? // "") != "none" and .c3dCA != null)
+          or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
+          or ((.c3d? // "") != "none" and .c3d != null)
+        then "ON"
+        else "OFF"
+        end
+    ' "$TMP_VS")
+  fi
 
-      curl -sS --insecure -u "$AUTH" "http://localhost:8100${link}" -o "$TMP_SSL" 2>/dev/null || continue
-
-      c3d_status="OFF"
-      if jq -e '
-        (.clientCertCA != null and .clientCertCA != "none")
-        or (.c3dCA != null and .c3dCA != "none")
-        or (.c3dCaCerts != null and .c3dCaCerts != "none")
-        or (.c3d != null and .c3d != "none")
-      ' >/dev/null 2>&1 <"$TMP_SSL"; then
-        c3d_status="ON"
-      fi
-      break
-    fi
-  done
-
-  printf "%-25s %-40s %-35s %-8s\n" "$part" "$vs_name" "$ssl_profile" "$c3d_status"
+  printf "%-25s %-40s %-35s %-8s\n" "$part" "$vs_name" "$ssl_name" "$c3d_status"
 done
