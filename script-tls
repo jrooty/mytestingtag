@@ -1,38 +1,124 @@
-  # Recherche du profil server-ssl et champ sslC3d
+#!/bin/bash
+# Audit des Virtual Servers avec C3D actif et pools associés (même partition)
+# Compatible jq minimal (F5, pas de // ni regex)
+# HTTP 8100, admin:
+# Un seul appel expandSubcollections pour VS + un seul pour Pools
+# Options :
+#   --debug      → traces détaillées
+#   --c3d-only   → n'affiche que les VS avec C3D=ON
+
+set -euo pipefail
+
+DEBUG=0
+FILTER_C3D_ONLY=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG=1 ;;
+    --c3d-only) FILTER_C3D_ONLY=1 ;;
+  esac
+done
+
+F5_HOST="localhost:8100"
+BASE="http://$F5_HOST"
+AUTH="admin:"
+VS_URL="$BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
+POOL_URL="$BASE/mgmt/tm/ltm/pool?expandSubcollections=true"
+
+TMP_VS=$(mktemp)
+TMP_POOL=$(mktemp)
+trap 'rm -f "$TMP_VS" "$TMP_POOL"' EXIT
+
+echo "[INFO] Lecture des Virtual Servers..."
+curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
+
+echo "[INFO] Lecture des Pools..."
+curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
+
+# Vérifie JSON minimalement
+for file in "$TMP_VS" "$TMP_POOL"; do
+  if ! jq -e . >/dev/null 2>&1 <"$file"; then
+    echo "[ERR] Fichier JSON invalide : $file"
+    head -n 20 "$file"
+    exit 1
+  fi
+done
+
+printf "\n%-25s %-40s %-35s %-8s %-40s\n" \
+  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOLS_ASSOCIÉS"
+printf "%s\n" \
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+# Boucle sur les VS
+jq -r '
+  .items[]? |
+  {
+    vs: .fullPath,
+    pool: (if .pool == null then "-" else .pool end),
+    profiles: (if .profilesReference.items == null then [] else .profilesReference.items end)
+  } | @base64
+' "$TMP_VS" | while read -r row; do
+  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
+
+  vs_path=$(_jq '.vs')
+  vs_pool=$(_jq '.pool')
+  part="${vs_path%/*}"; part="${part#/}"
+  vs_name="${vs_path##*/}"
+
+  ssl_name="-"
+  c3d_status="OFF"
+
+  profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
+
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
+
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
 
-        # Extraction multi-champs (tous optionnels)
-        sslC3d=$(echo "$profiles_json" | jq -r ".[$idx].sslC3d // empty")
-        sslC3dMode=$(echo "$profiles_json" | jq -r ".[$idx].sslC3dMode // empty")
-        sslC3dCa=$(echo "$profiles_json" | jq -r ".[$idx].sslC3dCaCert // empty")
-        sslC3dKey=$(echo "$profiles_json" | jq -r ".[$idx].sslC3dKey // empty")
-        sslC3dChain=$(echo "$profiles_json" | jq -r ".[$idx].sslC3dChain // empty")
+        sslC3d=$(echo "$profiles_json" | jq -r ".[$idx].sslC3d")
+        lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
 
-        # Normalisation en minuscules
-        lowerC3d=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
-        lowerMode=$(echo "$sslC3dMode" | tr '[:upper:]' '[:lower:]')
-
-        # C3D activé uniquement si un des critères est vrai
-        if [[ "$lowerC3d" == "enabled" ]] \
-          || [[ "$lowerMode" == "enabled" || "$lowerMode" == "require" ]] \
-          || [[ -n "$sslC3dCa" && "$sslC3dCa" != "none" ]] \
-          || [[ -n "$sslC3dKey" && "$sslC3dKey" != "none" ]] \
-          || [[ -n "$sslC3dChain" && "$sslC3dChain" != "none" ]]; then
+        if [[ "$lower" == "enabled" ]]; then
           c3d_status="ON"
-        else
-          c3d_status="OFF"
         fi
 
         if (( DEBUG )); then
-          echo "[DEBUG] Profil=$ssl_name sslC3d=$sslC3d sslC3dMode=$sslC3dMode sslC3dCa=$sslC3dCa sslC3dKey=$sslC3dKey sslC3dChain=$sslC3dChain → C3D=$c3d_status"
+          echo "[DEBUG] Profil SSL=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
         fi
         break
       fi
     done
   fi
+
+  # Filtrage si --c3d-only activé
+  if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
+    continue
+  fi
+
+  # Récupère tous les pools de la même partition
+  pools_in_part=$(jq -r --arg part "$part" '
+    .items[]
+    | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
+    | .name
+  ' "$TMP_POOL")
+
+  if [ -z "$pools_in_part" ]; then
+    pools_in_part="(aucun)"
+  else
+    pools_in_part=$(echo "$pools_in_part" | tr '\n' ' ' | sed 's/ *$//')
+  fi
+
+  printf "%-25s %-40s %-35s %-8s %-40s\n" \
+    "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pools_in_part"
+
+  if (( DEBUG )); then
+    echo "[DEBUG] VS=$vs_path pool=$vs_pool ssl=$ssl_name C3D=$c3d_status"
+    echo "[DEBUG] Pools même partition: $pools_in_part"
+  fi
+done
+
+echo -e "\n[INFO] Audit terminé."
