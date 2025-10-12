@@ -1,6 +1,6 @@
 #!/bin/bash
 # Audit complet : VS C3D + test TCP / TLS / mTLS sur les pool members
-# Compatible jq F5 (pas de regex, pas de //)
+# Compatible jq minimal (pas de regex, pas de //)
 # HTTP 8100, admin:
 # Options :
 #   --debug      → logs détaillés
@@ -18,7 +18,7 @@ for arg in "$@"; do
   esac
 done
 
-# Vars mTLS optionnelles
+# Variables mTLS optionnelles
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
 CA_FILE="ca.crt"
@@ -48,6 +48,7 @@ printf "\n%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
 printf "%s\n" \
   "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
+# Parcours des Virtual Servers
 jq -r '
   .items[]? |
   {
@@ -99,7 +100,7 @@ jq -r '
     continue
   fi
 
-  # Récupération des membres des pools de la même partition
+  # Récupération des membres IP:PORT pour les pools de la même partition
   jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
@@ -112,7 +113,8 @@ jq -r '
         port: (if .port != null and .port != 0 then (.port|tostring)
                elif (.name|split(":")|length>1) then (.name|split(":")[1])
                else "unknown" end)
-      } | @tsv
+      }
+    | "\(.addr)\t\(.port)"
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       tcp_res="KO"
       tls_res="KO"
@@ -121,29 +123,26 @@ jq -r '
       # Test TCP
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
+
         # Test TLS simple
         if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
           tls_res="OK"
         else
           tls_res="KO"
         fi
+
         # Test mTLS (si fichiers présents)
         if (( USE_MTLS )); then
           if timeout 5 openssl s_client -connect "$ip:$port" \
               -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
             mtls_res="OK"
-          else
-            mtls_res="KO"
           fi
         fi
-      else
-        tcp_res="KO"
       fi
 
       printf "%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
         "$part" "$vs_name" "$ip" "$port" "$tcp_res" "$tls_res" "$mtls_res"
   done
-
 done
 
 echo -e "\n[INFO] Audit complet terminé."
