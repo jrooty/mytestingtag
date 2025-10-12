@@ -1,6 +1,6 @@
 #!/bin/bash
 # Audit complet : VS C3D + test TCP / TLS / mTLS sur les pool members
-# Version stable + ajout couleurs et numérotation
+# Version stable (mêmes boucles jq) + couleurs et numérotation
 # HTTP 8100, admin:
 
 set -euo pipefail
@@ -14,7 +14,7 @@ for arg in "$@"; do
   esac
 done
 
-# Couleurs ANSI
+# Couleurs
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
 
 # Certificats client pour mTLS (optionnel)
@@ -24,7 +24,7 @@ CA_FILE="ca.crt"
 USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
-# F5 REST API
+# URLs F5
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
@@ -44,85 +44,56 @@ curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
 vs_counter=0
 
-# Liste des Virtual Servers
-jq -r '
-  .items[]? |
-  {
-    vs: .fullPath,
-    pool: (if .pool == null then "-" else .pool end),
-    profiles: (if .profilesReference.items == null then [] else .profilesReference.items end)
-  } | @base64
-' "$TMP_VS" | while read -r row; do
-  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
-
-  vs_path=$(_jq '.vs')
-  vs_pool=$(_jq '.pool')
+# Parcours des VS
+for vs_path in $(jq -r '.items[].fullPath' "$TMP_VS"); do
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
   c3d_status="OFF"
 
-  profiles_json=$(_jq '.profiles')
-  count=$(echo "$profiles_json" | jq 'length')
-
-  # Recherche du profil server-ssl
-  if [ "$count" -gt 0 ]; then
-    for idx in $(seq 0 $((count - 1))); do
-      name=$(echo "$profiles_json" | jq -r ".[$idx].name")
-      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
-      if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-        ssl_name="$name"
-        if [[ "$link" == http* ]]; then
-          link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
-        else
-          link="$BASE$link"
-        fi
-        curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" || continue
-        sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-        lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
-        [[ "$lower" == "enabled" ]] && c3d_status="ON"
-        (( DEBUG )) && echo "[DEBUG] VS=$vs_name profil=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
-        break
+  profiles=$(jq -r --arg vs "$vs_path" '.items[] | select(.fullPath==$vs) | .profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null || true)
+  for link in $profiles; do
+    if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
+      if [[ "$link" == http* ]]; then
+        link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
+      else
+        link="$BASE$link"
       fi
-    done
-  fi
+      curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
+      sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
+      [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
+    fi
+  done
 
-  # Filtrage C3D
-  if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
-    continue
-  fi
+  (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]] && continue
 
   ((vs_counter++))
-  echo -e "\n${BOLD}#${vs_counter}  Partition: ${part}  |  VS: ${vs_name}  |  C3D: ${c3d_status}${RESET}"
+  echo -e "\n${BOLD}#${vs_counter} Partition:${RESET} ${part}  ${BOLD}| VS:${RESET} ${vs_name}  ${BOLD}| C3D:${RESET} ${c3d_status}"
 
-  # Récupération des membres IP:PORT
+  # Liste des membres des pools dans la même partition
   jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
     | .membersReference.items[]?
-    | {
-        addr: (if .address != null then .address
-               elif .addr != null then .addr
-               elif (.name|split(":")|length>0) then (.name|split(":")[0])
-               else "unknown" end),
-        port: (if .port != null and .port != 0 then (.port|tostring)
-               elif (.name|split(":")|length>1) then (.name|split(":")[1])
-               else "unknown" end)
-      }
-    | "\(.addr)\t\(.port)"
+    | [
+        (if .address != null then .address
+         elif .addr != null then .addr
+         else (.name|split(":")[0]) end),
+        (if .port != null and .port != 0 then (.port|tostring)
+         elif (.name|split(":")|length>1) then (.name|split(":")[1])
+         else "unknown" end)
+      ] | join("\t")
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       [ -z "$ip" ] && continue
+
       tcp_res="KO"; tls_res="KO"; mtls_res="KO"
 
-      # Test TCP
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
-        # Test TLS
         if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
           tls_res="OK"
         fi
-        # Test mTLS
         if (( USE_MTLS )); then
           if timeout 5 openssl s_client -connect "$ip:$port" \
               -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
@@ -133,7 +104,6 @@ jq -r '
         fi
       fi
 
-      # Couleurs
       [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}$tcp_res${RESET}" || tcp_col="${RED}$tcp_res${RESET}"
       [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}$tls_res${RESET}" || tls_col="${RED}$tls_res${RESET}"
       case "$mtls_res" in
