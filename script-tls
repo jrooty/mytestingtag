@@ -1,5 +1,5 @@
 # =========================
-# MODE DIRECT --target
+# MODE DIRECT --target (version du vendredi, fonctionnelle)
 # =========================
 if [[ -n "$TARGET" ]]; then
   IP="${TARGET%%:*}"
@@ -16,16 +16,16 @@ if [[ -n "$TARGET" ]]; then
     tcp_res="OK"
 
     # Test TLS simple
-    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null \
-        | grep -q "BEGIN CERTIFICATE"; then
+    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
+        | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
       tls_res="OK"
     fi
 
     # Test mTLS si matériel présent
     if (( USE_MTLS )); then
       if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
-           -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null \
-           | grep -q "BEGIN CERTIFICATE"; then
+           -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 \
+           | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
         mtls_res="OK"
       else
         mtls_res="REQ"
@@ -33,7 +33,6 @@ if [[ -n "$TARGET" ]]; then
     fi
   fi
 
-  # Couleurs
   GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
   [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
   [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
@@ -47,20 +46,18 @@ if [[ -n "$TARGET" ]]; then
   echo -e "${BOLD}Résultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
   echo
 
-  # ----- Détails certificat serveur -----
+  # ----- Détails certificat serveur (version du vendredi, fonctionnelle) -----
   if [[ "$tls_res" == "OK" ]]; then
     echo "[INFO] Détails certificat serveur :"
     if [[ -n "$SNI" ]]; then
-      openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null \
-        | awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' \
-        | head -n 100 \
+      openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null 2>&1 \
+        | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
         | openssl x509 -noout \
             -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null \
         | sed 's/^/  /'
     else
-      openssl s_client -connect "${IP}:${PORT}" -showcerts </dev/null \
-        | awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' \
-        | head -n 100 \
+      openssl s_client -connect "${IP}:${PORT}" -showcerts </dev/null 2>&1 \
+        | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
         | openssl x509 -noout \
             -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null \
         | sed 's/^/  /'
@@ -68,13 +65,13 @@ if [[ -n "$TARGET" ]]; then
     echo
   fi
 
-  # ----- CA acceptées par le serveur pour mTLS -----
+  # ----- CA acceptées par le serveur -----
   echo "[INFO] CA acceptées par le serveur (si fournies) :"
   if [[ -n "$SNI" ]]; then
-    openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" </dev/null \
+    openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" </dev/null 2>&1 \
       | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
   else
-    openssl s_client -connect "${IP}:${PORT}" </dev/null \
+    openssl s_client -connect "${IP}:${PORT}" </dev/null 2>&1 \
       | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
   fi
   echo
