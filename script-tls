@@ -1,7 +1,6 @@
 #!/bin/bash
-# Audit des Virtual Servers avec expandSubcollections=true
-# Détecte profils server-ssl + C3D actif, via un SEUL appel iControl REST.
-# Connexion locale (HTTP 8100), admin: sans mot de passe.
+# Audit des Virtual Servers (HTTP 8100, admin:) avec expandSubcollections=true
+# Détecte profils server-ssl et C3D actif — 100% compatible avec jq sans regex.
 
 set -euo pipefail
 
@@ -10,25 +9,24 @@ AUTH="admin:"
 TMP_VS=$(mktemp)
 trap 'rm -f "$TMP_VS"' EXIT
 
-echo "[INFO] Récupération de la liste complète des VS (expandSubcollections=true)..."
+echo "[INFO] Lecture des Virtual Servers (expandSubcollections=true)..."
 curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
 
 # Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non valide JSON, extrait :"
+  echo "[ERR] Réponse non JSON. Extrait :"
   head -n 20 "$TMP_VS"
   exit 1
 fi
 
 printf "%-25s %-40s %-35s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 
+# Boucle sur chaque VS
 jq -r '
   .items[]? |
   {
     vs: .fullPath,
-    profiles: (.profilesReference.items // [] |
-                map(select(.context == "serverside" and (.name | test("server-ssl";"i"))))
-               )
+    profiles: (.profilesReference.items // [])
   } | @base64
 ' "$TMP_VS" | while read -r vs_enc; do
   _jq() { echo "$vs_enc" | base64 --decode | jq -r "$1"; }
@@ -37,21 +35,39 @@ jq -r '
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  # Profil serveur SSL (si présent)
-  ssl_name=$(_jq '.profiles[0].name // "-"')
+  ssl_name="-"
   c3d_status="-"
 
-  if [[ "$ssl_name" != "-" ]]; then
-    # Cherche les attributs C3D directement dans le JSON expandu
-    c3d_status=$(jq -r --arg VS "$vs_path" '
+  # Chercher les profils server-ssl (sans regex)
+  for i in $(_jq '.profiles | length'); do :; done  # no-op, for jq load
+  profile_json=$(_jq '.profiles')
+  count=$(echo "$profile_json" | jq 'length')
+
+  if [ "$count" -gt 0 ]; then
+    for idx in $(seq 0 $((count - 1))); do
+      name=$(echo "$profile_json" | jq -r ".[$idx].name // empty")
+      ctx=$(echo "$profile_json" | jq -r ".[$idx].context // empty")
+      # Détection server-ssl insensible à la casse via 'index'
+      if echo "$name" | tr '[:upper:]' '[:lower:]' | grep -q "server-ssl"; then
+        if [ "$ctx" = "serverside" ] || [ -z "$ctx" ]; then
+          ssl_name="$name"
+          break
+        fi
+      fi
+    done
+  fi
+
+  # Si un profil server-ssl a été trouvé, on cherche ses champs C3D dans le même JSON
+  if [ "$ssl_name" != "-" ]; then
+    c3d_status=$(jq -r --arg VS "$vs_path" --arg SSL "$ssl_name" '
       .items[]
       | select(.fullPath == $VS)
       | .profilesReference.items[]
-      | select(.context == "serverside" and (.name | test("server-ssl";"i")))
+      | select((.name == $SSL) and ((.context == "serverside") or (.context == null)))
       | if ((.clientCertCA? // "") != "none" and .clientCertCA != null)
-          or ((.c3dCA? // "") != "none" and .c3dCA != null)
-          or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
-          or ((.c3d? // "") != "none" and .c3d != null)
+        or ((.c3dCA? // "") != "none" and .c3dCA != null)
+        or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
+        or ((.c3d? // "") != "none" and .c3d != null)
         then "ON"
         else "OFF"
         end
