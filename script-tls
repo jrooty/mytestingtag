@@ -1,24 +1,22 @@
 #!/bin/bash
 # Audit complet VS + test TCP / TLS / mTLS sur les pool members
-# Version stable + délai configurable + logique inversée (--all-vs)
+# Version stable + logique inversée (--all-vs) + sleep configurable + mode --target
 
 set -euo pipefail
 
 DEBUG=0
 ALL_VS=0
-SLEEP_MS=200  # Délai par défaut : 200 ms
-
+SLEEP_MS=200
+TARGET=""
 for arg in "$@"; do
   case "$arg" in
     --debug) DEBUG=1 ;;
     --all-vs) ALL_VS=1 ;;
-    --sleep-ms=*)
-      SLEEP_MS="${arg#*=}"
-      ;;
+    --sleep-ms=*) SLEEP_MS="${arg#*=}" ;;
+    --target=*) TARGET="${arg#*=}" ;;
   esac
 done
 
-# Conversion millisecondes → secondes
 SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", $SLEEP_MS / 1000 }")
 
 CLIENT_CERT="client.crt"
@@ -27,6 +25,45 @@ CA_FILE="ca.crt"
 USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
+# Si --target est spécifié, on fait un test direct et on quitte
+if [[ -n "$TARGET" ]]; then
+  IP="${TARGET%%:*}"
+  PORT="${TARGET##*:}"
+
+  echo -e "[INFO] Test direct sur ${IP}:${PORT}\n"
+
+  tcp_res="KO"; tls_res="KO"; mtls_res="KO"
+
+  if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
+    tcp_res="OK"
+    if timeout 5 openssl s_client -connect "$IP:$PORT" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
+      tls_res="OK"
+    fi
+    if (( USE_MTLS )); then
+      if timeout 5 openssl s_client -connect "$IP:$PORT" \
+          -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
+        mtls_res="OK"
+      else
+        mtls_res="REQ"
+      fi
+    fi
+  fi
+
+  # Couleurs
+  GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; RESET="\033[0m"
+  [[ "$tcp_res" == "OK" ]] && tcp_res="${GREEN}${tcp_res}${RESET}" || tcp_res="${RED}${tcp_res}${RESET}"
+  [[ "$tls_res" == "OK" ]] && tls_res="${GREEN}${tls_res}${RESET}" || tls_res="${RED}${tls_res}${RESET}"
+  case "$mtls_res" in
+    OK) mtls_res="${GREEN}${mtls_res}${RESET}" ;;
+    REQ) mtls_res="${YELLOW}${mtls_res}${RESET}" ;;
+    *) mtls_res="${RED}${mtls_res}${RESET}" ;;
+  esac
+
+  echo "Résultats : TCP=$tcp_res   TLS=$tls_res   mTLS=$mtls_res"
+  exit 0
+fi
+
+# --- Mode normal F5 ---
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
@@ -38,7 +75,6 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
-# ---- Comptage initial ----
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 total_vs=$(jq -r '.items | length' "$TMP_VS" 2>/dev/null || echo 0)
 total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null \
@@ -54,7 +90,6 @@ else
 fi
 echo
 
-# ---- Script principal inchangé ----
 {
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
@@ -91,7 +126,7 @@ jq -r '
     done
   fi
 
-  # 🧠 logique inversée : on garde par défaut uniquement les VS C3D=ON
+  # par défaut : on ne garde que C3D=ON sauf si --all-vs
   if (( !ALL_VS )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
@@ -130,8 +165,6 @@ jq -r '
       fi
 
       echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
-
-      # 💤 Délai configurable
       sleep "$SLEEP_SEC"
   done
 done
@@ -140,13 +173,11 @@ BEGIN {
   red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
   vsnum=0
 }
-# VS header
 /^#VS#/ {
   vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
   printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
   next
 }
-# Pool members
 {
   part=$1; vs=$2; ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
   if (tcp=="OK") tcp=green tcp reset; else tcp=red tcp reset;
