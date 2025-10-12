@@ -10,19 +10,12 @@ trap 'rm -f "$TMP" "$CERT"' EXIT
 echo "[INFO] Connexion à $IPPORT (SNI=$SNI)"
 openssl s_client -connect "$IPPORT" -servername "$SNI" -showcerts </dev/null >"$TMP" 2>&1
 
-# Étape 1 : extraction dans un vrai fichier
 awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" > "$CERT"
 
-# Étape 2 : vérification manuelle
 if grep -q "BEGIN CERTIFICATE" "$CERT"; then
-  echo "[INFO] Premier certificat extrait : $(wc -l < "$CERT") lignes"
-  head -n 3 "$CERT"
-  echo
-
-  # Étape 3 : décodage séparé (pas en pipe)
   echo "[INFO] Détails certificat serveur :"
   openssl x509 -in "$CERT" -noout \
-    -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>&1 | sed 's/^/  /'
+    -subject -issuer -dates -fingerprint -sha256 2>/dev/null | sed 's/^/  /'
 else
   echo "[ERREUR] Aucun certificat extrait."
 fi
