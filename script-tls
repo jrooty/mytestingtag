@@ -1,7 +1,8 @@
 #!/bin/bash
-# Audit VS + tests TCP/TLS/mTLS + mode direct
-# Compatible F5 iControl REST localhost:8100 admin:
-# Version finale stable (mode normal + mode --target + affichage complet certs)
+# Audit VS + tests TCP/TLS/mTLS + mode direct --target
+# Compatible F5 iControl REST (http://localhost:8100, admin:)
+# Par defaut: ne teste que les VS avec C3D=ON; utiliser --all-vs pour tout
+# Duree entre members: --sleep-ms=N (200 ms par defaut)
 
 set -euo pipefail
 
@@ -11,45 +12,53 @@ SLEEP_MS=200
 TARGET=""
 SNI=""
 
-# ---------- Parsing options ----------
-while (( $# )); do
+# ---------- Parsing options (simple et robuste) ----------
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --debug) DEBUG=1; shift ;;
     --all-vs) ALL_VS=1; shift ;;
     --sleep-ms=*) SLEEP_MS="${1#*=}"; shift ;;
     --sleep-ms) shift; SLEEP_MS="${1:-200}"; shift || true ;;
     --target=*) TARGET="${1#*=}"; shift ;;
-    --target) shift; TARGET="${1:-}"; if [[ -n "${2-}" && "${2:0:2}" != "--" && -z "$TARGET" ]]; then TARGET="$2"; shift; fi ;;
+    --target) shift; TARGET="${1:-}"; shift || true ;;
     --sni=*) SNI="${1#*=}"; shift ;;
-    --sni) shift; SNI="${1:-}"; if [[ -n "${2-}" && "${2:0:2}" != "--" && -z "$SNI" ]]; then SNI="$2"; shift; fi ;;
+    --sni) shift; SNI="${1:-}"; shift || true ;;
     *) break ;;
   esac
 done
 
+# Conversion millisecondes -> secondes pour sleep
 SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", ${SLEEP_MS} / 1000 }")
 
+# Fichiers mTLS optionnels
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
 CA_FILE="ca.crt"
 USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
-# ---------- Fonctions ----------
-extract_server_cert_details() {
-  local ip="$1" port="$2" sni_host="$3"
-  local cmd="openssl s_client -connect ${ip}:${port} -showcerts </dev/null 2>/dev/null"
-  [[ -n "$sni_host" ]] && cmd="openssl s_client -connect ${ip}:${port} -servername ${sni_host} -showcerts </dev/null 2>/dev/null"
+# ---------- Fonctions utiles ----------
+extract_first_cert_from_sclient() {
+  # Lit stdin (s_client) et renvoie le premier certificat PEM sur stdout
+  awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}'
+}
 
-  eval "$cmd" \
-    | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
-    | openssl x509 -noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null
+print_server_cert_details() {
+  # $1 = PEM cert on stdin
+  openssl x509 -noout \
+    -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null
 }
 
 list_server_acceptable_cas() {
+  # $1 ip $2 port $3 sni(optional)
   local ip="$1" port="$2" sni_host="$3"
-  local cmd="openssl s_client -connect ${ip}:${port} </dev/null 2>/dev/null"
-  [[ -n "$sni_host" ]] && cmd="openssl s_client -connect ${ip}:${port} -servername ${sni_host} </dev/null 2>/dev/null"
-  eval "$cmd" | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print} flag && /^$/{flag=0}'
+  if [[ -n "$sni_host" ]]; then
+    openssl s_client -connect "${ip}:${port}" -servername "${sni_host}" </dev/null 2>/dev/null \
+    | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print} flag && /^$/{flag=0}'
+  else
+    openssl s_client -connect "${ip}:${port}" </dev/null 2>/dev/null \
+    | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print} flag && /^$/{flag=0}'
+  fi
 }
 
 # =========================
@@ -60,17 +69,22 @@ if [[ -n "$TARGET" ]]; then
   PORT="${TARGET##*:}"
   [[ -z "$SNI" ]] && SNI="$IP"
 
-  echo "[INFO] Mode direct --target détecté : ${IP}:${PORT}"
-  echo "[INFO] Délai inter-tests (ignoré en mode direct) : ${SLEEP_MS} ms"
+  echo "[INFO] Mode direct --target: ${IP}:${PORT}"
   echo
 
   tcp_res="KO"; tls_res="KO"; mtls_res="KO"
 
+  # Test TCP
   if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
     tcp_res="OK"
-    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
+
+    # Test TLS simple (et extraction cert)
+    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>/dev/null \
+        | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
       tls_res="OK"
     fi
+
+    # Test mTLS si materiel present
     if (( USE_MTLS )); then
       if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
            -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null \
@@ -82,6 +96,7 @@ if [[ -n "$TARGET" ]]; then
     fi
   fi
 
+  # Couleurs
   GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
   [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
   [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
@@ -92,23 +107,41 @@ if [[ -n "$TARGET" ]]; then
   esac
 
   echo -e "${BOLD}Cible:${RESET} ${IP}:${PORT}   ${BOLD}SNI:${RESET} ${SNI}"
-  echo -e "${BOLD}Résultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
+  echo -e "${BOLD}Resultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
   echo
 
+  # Details certificat serveur si TLS OK
   if [[ "$tls_res" == "OK" ]]; then
-    echo "[INFO] Détails certificat serveur :"
-    extract_server_cert_details "$IP" "$PORT" "$SNI" | sed 's/^/  /'
+    echo "[INFO] Details certificat serveur:"
+    # On relance s_client pour extraire proprement le 1er cert puis on affiche les details
+    if [[ -n "$SNI" ]]; then
+      openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null 2>/dev/null \
+        | extract_first_cert_from_sclient \
+        | print_server_cert_details \
+        | sed 's/^/  /'
+    else
+      openssl s_client -connect "${IP}:${PORT}" -showcerts </dev/null 2>/dev/null \
+        | extract_first_cert_from_sclient \
+        | print_server_cert_details \
+        | sed 's/^/  /'
+    fi
     echo
   fi
 
+  # Infos mTLS locales et CA acceptees si materiel present
   if (( USE_MTLS )); then
-    echo "[INFO] Matériel client mTLS local :"
-    echo "  Client cert (subject): $(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')"
-    echo "  Client cert (issuer) : $(openssl x509 -in "$CLIENT_CERT" -noout -issuer  2>/dev/null | sed 's/^issuer= *//')"
-    echo "  CA locale (subject)  : $(openssl x509 -in "$CA_FILE"     -noout -subject 2>/dev/null | sed 's/^subject= *//')"
-    echo "  CA locale (issuer)   : $(openssl x509 -in "$CA_FILE"     -noout -issuer  2>/dev/null | sed 's/^issuer= *//')"
+    echo "[INFO] Materiel client mTLS local:"
+    subj_client=$(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_client=$(openssl x509 -in "$CLIENT_CERT" -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
+    subj_ca=$(openssl x509 -in "$CA_FILE"     -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_ca=$(openssl x509 -in "$CA_FILE"      -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
+    echo "  Client cert (subject): ${subj_client}"
+    echo "  Client cert (issuer) : ${iss_client}"
+    echo "  CA locale (subject)  : ${subj_ca}"
+    echo "  CA locale (issuer)   : ${iss_ca}"
     echo
-    echo "[INFO] (Best effort) CA acceptées par le serveur pour le client cert :"
+
+    echo "[INFO] (Best effort) CA acceptees par le serveur pour le client cert:"
     cas=$(list_server_acceptable_cas "$IP" "$PORT" "$SNI")
     if [[ -n "$cas" ]]; then
       echo "$cas" | sed 's/^/  /'
@@ -117,15 +150,16 @@ if [[ -n "$TARGET" ]]; then
     fi
     echo
   else
-    echo "[INFO] mTLS non activé localement (fichiers manquants : $CLIENT_CERT, $CLIENT_KEY, $CA_FILE)."
+    echo "[INFO] mTLS non active localement (fichiers manquants: $CLIENT_CERT, $CLIENT_KEY, $CA_FILE)."
   fi
 
   exit 0
 fi
 
 # =========================
-# MODE NORMAL F5
+# MODE NORMAL F5 (structure intacte)
 # =========================
+
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
@@ -137,17 +171,18 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
+# Comptage et entetes d'info
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 total_vs=$(jq -r '.items | length' "$TMP_VS" 2>/dev/null || echo 0)
 total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null | grep -c "ltm/profile/server-ssl/" || true)
 
 echo -e "\n[INFO] Nombre total de Virtual Servers : ${total_vs}"
 echo -e "[INFO] Nombre de Virtual Servers avec profil server-ssl : ${total_ssl}"
-echo -e "[INFO] Délai entre tests de membres : ${SLEEP_MS} ms"
+echo -e "[INFO] Delai entre tests de membres : ${SLEEP_MS} ms"
 if (( ALL_VS )); then
-  echo -e "[INFO] Mode sélectionné : Tous les Virtual Servers (--all-vs)"
+  echo -e "[INFO] Mode selectionne : Tous les Virtual Servers (--all-vs)"
 else
-  echo -e "[INFO] Mode sélectionné : Seulement les VS avec C3D activé (par défaut)"
+  echo -e "[INFO] Mode selectionne : Seulement les VS avec C3D active (par defaut)"
 fi
 echo
 
@@ -165,28 +200,40 @@ jq -r '
   _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
+  vs_pool=$(_jq '.pool')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
   c3d_status="OFF"
+
   profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
 
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
+      name=$(echo "$profiles_json" | jq -r ".[$idx].name")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-        [[ "$link" == http* ]] || link="$BASE$link"
-        link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
+        ssl_name="$name"
+        if [[ "$link" == http* ]]; then
+          link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
+        else
+          link="$BASE$link"
+        fi
         curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
         sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-        [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
+        lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lower" == "enabled" ]]; then
+          c3d_status="ON"
+        fi
+        (( DEBUG )) && echo "[DEBUG] VS=$vs_name profil=$ssl_name sslC3d=$sslC3d -> C3D=$c3d_status"
         break
       fi
     done
   fi
 
+  # Par defaut: garder uniquement C3D=ON sauf si --all-vs
   if (( !ALL_VS )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
@@ -209,11 +256,14 @@ jq -r '
       [ -z "$ip" ] && continue
       tcp_res="KO"; tls_res="KO"; mtls_res="KO"
 
+      # TCP
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
+        # TLS
         if timeout 8 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
           tls_res="OK"
         fi
+        # mTLS
         if (( USE_MTLS )); then
           if timeout 8 openssl s_client -connect "$ip:$port" \
               -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
@@ -233,11 +283,13 @@ BEGIN {
   red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
   vsnum=0
 }
+# Entete VS
 /^#VS#/ {
   vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
   printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
   next
 }
+# Lignes membres
 {
   part=$1; vs=$2; ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
   if (tcp=="OK") tcp=green tcp reset; else tcp=red tcp reset;
@@ -247,4 +299,4 @@ BEGIN {
   else mtls=red mtls reset;
   printf("    %s:%s   TCP=%s   TLS=%s   mTLS=%s\n", ip, port, tcp, tls, mtls);
 }
-END { print "\n[INFO] Audit complet terminé." }'
+END { print "\n[INFO] Audit complet termine." }'
