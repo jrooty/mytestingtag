@@ -1,16 +1,12 @@
 #!/bin/bash
-# Audit complet : VS C3D + test TCP / TLS / mTLS sur les pool members
-# Compatible jq minimal (pas de regex, pas de //)
+# Audit complet VS C3D + test TCP / TLS / mTLS sur les pool members
+# Compatible jq minimal F5
 # HTTP 8100, admin:
-# Options :
-#   --debug      → logs détaillés
-#   --c3d-only   → n'affiche que les VS avec C3D=ON
 
 set -euo pipefail
 
 DEBUG=0
 FILTER_C3D_ONLY=0
-
 for arg in "$@"; do
   case "$arg" in
     --debug) DEBUG=1 ;;
@@ -18,11 +14,17 @@ for arg in "$@"; do
   esac
 done
 
-# Variables mTLS optionnelles
+# Couleurs
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+# mTLS optionnel
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
 CA_FILE="ca.crt"
-
 USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
@@ -39,16 +41,11 @@ trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
 echo "[INFO] Lecture des Virtual Servers..."
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
-
-echo "[INFO] Lecture des Pools et de leurs membres..."
+echo "[INFO] Lecture des Pools..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-printf "\n%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
-  "PARTITION" "VS_NAME" "POOL_MEMBER" "PORT" "TCP" "TLS" "mTLS"
-printf "%s\n" \
-  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+vs_counter=0
 
-# Parcours des Virtual Servers
 jq -r '
   .items[]? |
   {
@@ -70,12 +67,11 @@ jq -r '
   profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
 
-  # Recherche du profil server-ssl
+  # Recherche profil SSL
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
-
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
         if [[ "$link" == http* ]]; then
@@ -85,22 +81,21 @@ jq -r '
         fi
         curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" || continue
         sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-        lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
-        if [[ "$lower" == "enabled" ]]; then
+        if [[ "${sslC3d,,}" == "enabled" ]]; then
           c3d_status="ON"
         fi
-        (( DEBUG )) && echo "[DEBUG] VS=$vs_name profil=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
         break
       fi
     done
   fi
 
-  # Filtrage si --c3d-only
   if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
 
-  # Récupération des membres IP:PORT pour les pools de la même partition
+  ((vs_counter++))
+  echo -e "\n${BOLD}#${vs_counter}  Partition: $part  |  VS: $vs_name  |  SSL Profile: $ssl_name  |  C3D: $c3d_status${RESET}"
+
   jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
@@ -116,32 +111,40 @@ jq -r '
       }
     | "\(.addr)\t\(.port)"
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
+      [ -z "$ip" ] && continue
+
       tcp_res="KO"
       tls_res="KO"
       mtls_res="KO"
 
-      # Test TCP
+      # --- TCP ---
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
-
-        # Test TLS simple
-        if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
+        # --- TLS ---
+        if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
           tls_res="OK"
         else
           tls_res="KO"
         fi
-
-        # Test mTLS (si fichiers présents)
+        # --- mTLS ---
         if (( USE_MTLS )); then
           if timeout 5 openssl s_client -connect "$ip:$port" \
-              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
+              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
             mtls_res="OK"
+          else
+            mtls_res="REQ"  # tentative échouée
           fi
         fi
       fi
 
-      printf "%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
-        "$part" "$vs_name" "$ip" "$port" "$tcp_res" "$tls_res" "$mtls_res"
+      # Couleurs
+      case "$tcp_res" in OK) tcp_color="${GREEN}$tcp_res${RESET}";; *) tcp_color="${RED}$tcp_res${RESET}";; esac
+      case "$tls_res" in OK) tls_color="${GREEN}$tls_res${RESET}";; *) tls_color="${RED}$tls_res${RESET}";; esac
+      case "$mtls_res" in OK) mtls_color="${GREEN}$mtls_res${RESET}";;
+                            REQ) mtls_color="${YELLOW}$mtls_res${RESET}";;
+                            *) mtls_color="${RED}$mtls_res${RESET}";; esac
+
+      echo -e "    $ip:$port   TCP=$tcp_color   TLS=$tls_color   mTLS=$mtls_color"
   done
 done
 
