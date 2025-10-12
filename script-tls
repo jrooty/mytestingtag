@@ -1,6 +1,6 @@
 #!/bin/bash
-# Détecte les VS HTTPS (toutes partitions) avec C3D activé sur leur profil server-ssl
-# via iControl REST local (HTTP:8100) avec admin: sans mot de passe
+# Détecte tous les VS HTTPS (toutes partitions) avec C3D actif sur profil server-ssl
+# Connexion locale iControl REST (HTTP 8100) avec admin: sans mot de passe.
 
 set -euo pipefail
 
@@ -10,26 +10,26 @@ TMP_VS=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-echo "[INFO] Récupération des VS sur toutes les partitions..."
-curl -sS --insecure -u "$AUTH" "$F5_URL/mgmt/tm/ltm/virtual?recursive=true" -o "$TMP_VS"
+echo "[INFO] Récupération de tous les VS (toutes partitions, avec profils expandus)..."
+curl -sS --insecure -u "$AUTH" \
+  "$F5_URL/mgmt/tm/ltm/virtual?recursive=true&expandSubcollections=true" -o "$TMP_VS"
 
 # Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non valide JSON, extrait :"
+  echo "[ERR] Réponse non JSON, extrait :"
   head -n 20 "$TMP_VS"
   exit 1
 fi
 
 printf "%-25s %-40s %-30s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 
-# 🔹 Parcours sécurisé : ignorer VS sans profils
+# 🔹 Parcours de chaque VS qui possède au moins un profil
 jq -r '
   .items[]? |
-  . as $vs |
-  select($vs.profilesReference.items != null) |
+  select(.profilesReference.items != null) |
   {
-    vs: $vs.fullPath,
-    profiles: ($vs.profilesReference.items | map(.fullPath) | join(" "))
+    vs: .fullPath,
+    profiles: (.profilesReference.items | map(.fullPath // .name) | join(" "))
   } | @base64
 ' "$TMP_VS" | while read -r vs_enc; do
 
@@ -40,23 +40,23 @@ jq -r '
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  # Recherche de profils server-ssl
+  # Recherche de profils server-ssl dans les noms listés
   for p in $profiles; do
-    if [[ "$p" == *server-ssl* ]]; then
+    if [[ "$p" == *server-ssl* || "$p" == *ServerSSL* ]]; then
       profile_name="${p##*/}"
 
-      # Lecture du profil server-ssl (GET)
+      # Lecture du profil server-ssl
       curl -sS --insecure -u "$AUTH" \
-        "$F5_URL/mgmt/tm/ltm/profile/server-ssl/~$part~$profile_name" -o "$TMP_SSL" || continue
+        "$F5_URL/mgmt/tm/ltm/profile/server-ssl/~$part~$profile_name" -o "$TMP_SSL" 2>/dev/null || continue
 
-      # Vérifie les champs potentiels C3D
+      # Vérifie C3D activé
       c3d_status="OFF"
       if jq -e '
-          (.clientCertCA != null and .clientCertCA != "none") or
-          (.c3dCA != null and .c3dCA != "none") or
-          (.c3dCaCerts != null and .c3dCaCerts != "none") or
-          (.c3d != null and .c3d != "none")
-        ' >/dev/null 2>&1 <"$TMP_SSL"; then
+        (.clientCertCA != null and .clientCertCA != "none") or
+        (.c3dCA != null and .c3dCA != "none") or
+        (.c3dCaCerts != null and .c3dCaCerts != "none") or
+        (.c3d != null and .c3d != "none")
+      ' >/dev/null 2>&1 <"$TMP_SSL"; then
         c3d_status="ON"
       fi
 
