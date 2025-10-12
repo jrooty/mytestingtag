@@ -1,17 +1,25 @@
 #!/bin/bash
 # Audit complet VS + test TCP / TLS / mTLS sur les pool members
-# Version stable confirmée : liste totale VS + VS avec profil server-ssl
+# Version stable + délai configurable entre tests des members
 
 set -euo pipefail
 
 DEBUG=0
 FILTER_C3D_ONLY=0
+SLEEP_MS=200  # Valeur par défaut : 200 ms
+
 for arg in "$@"; do
   case "$arg" in
     --debug) DEBUG=1 ;;
     --c3d-only) FILTER_C3D_ONLY=1 ;;
+    --sleep-ms=*)
+      SLEEP_MS="${arg#*=}"
+      ;;
   esac
 done
+
+# Conversion en secondes pour sleep
+SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", $SLEEP_MS / 1000 }")
 
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
@@ -37,7 +45,8 @@ total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP
   | grep -c "ltm/profile/server-ssl/" || true)
 
 echo -e "\n[INFO] Nombre total de Virtual Servers : ${total_vs}"
-echo -e "[INFO] Nombre de Virtual Servers avec profil server-ssl : ${total_ssl}\n"
+echo -e "[INFO] Nombre de Virtual Servers avec profil server-ssl : ${total_ssl}"
+echo -e "[INFO] Délai entre tests de membres : ${SLEEP_MS} ms\n"
 
 # ---- Script principal inchangé ----
 {
@@ -97,6 +106,7 @@ jq -r '
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       [ -z "$ip" ] && continue
       tcp_res="KO"; tls_res="KO"; mtls_res="KO"
+
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
         if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
@@ -111,7 +121,11 @@ jq -r '
           fi
         fi
       fi
+
       echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
+
+      # 💤 délai configurable entre deux tests
+      sleep "$SLEEP_SEC"
   done
 done
 } | awk '
@@ -119,7 +133,7 @@ BEGIN {
   red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
   vsnum=0
 }
-# VS
+# VS header
 /^#VS#/ {
   vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
   printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
