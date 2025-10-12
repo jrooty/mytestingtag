@@ -1,9 +1,7 @@
 #!/bin/bash
-# Audit des Virtual Servers avec C3D actif et leurs pools dans la même partition
-# 1 appel expandSubcollections pour les VS
-# 1 appel expandSubcollections pour les pools
-# HTTP (port 8100), admin:, compatible jq sans regex
-# Option --debug pour inspection détaillée
+# Audit des Virtual Servers avec C3D actif et pools associés (même partition)
+# Compatible jq minimal F5 (pas de //, pas de regex)
+# HTTP 8100, admin:, 1 appel expand VS + 1 appel expand Pools
 
 set -euo pipefail
 
@@ -14,7 +12,6 @@ DEBUG=0
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
-
 VS_URL="$BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
 POOL_URL="$BASE/mgmt/tm/ltm/pool?expandSubcollections=true"
 
@@ -40,7 +37,7 @@ if ! jq -e . >/dev/null 2>&1 <"$TMP_POOL"; then
   exit 1
 fi
 
-printf "\n%-25s %-40s %-35s %-8s %-40s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_ASSOCIÉS"
+printf "\n%-25s %-40s %-35s %-8s %-40s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOLS_ASSOCIÉS"
 printf "%s\n" "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 # --- Boucle sur tous les VS ---
@@ -48,8 +45,8 @@ jq -r '
   .items[]? |
   {
     vs: .fullPath,
-    pool: .pool // "-",
-    profiles: (.profilesReference.items // [])
+    pool: (if .pool == null then "-" else .pool end),
+    profiles: (if .profilesReference.items == null then [] else .profilesReference.items end)
   } | @base64
 ' "$TMP_VS" | while read -r row; do
   _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
@@ -64,16 +61,15 @@ jq -r '
 
   profiles_json=$(_jq '.profiles')
 
-  # Recherche du profil server-ssl
+  # Recherche du profil server-ssl et champ sslC3d
   count=$(echo "$profiles_json" | jq 'length')
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
-      name=$(echo "$profiles_json" | jq -r ".[$idx].name // empty")
-      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
+      name=$(echo "$profiles_json" | jq -r ".[$idx].name")
+      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-        # Lire le champ sslC3d directement s'il est présent dans expandSubcollections
-        raw=$(echo "$profiles_json" | jq -r ".[$idx].sslC3d // empty")
+        raw=$(echo "$profiles_json" | jq -r ".[$idx].sslC3d")
         lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
         if [[ -n "$raw" && "$lower" != "disabled" && "$lower" != "none" ]]; then
           c3d_status="ON"
@@ -83,11 +79,13 @@ jq -r '
     done
   fi
 
-  # Si C3D activé → recherche des pools de la même partition
+  # Si C3D activé → rechercher les pools de la même partition
   pools_in_part="-"
   if [ "$c3d_status" = "ON" ]; then
     pools_in_part=$(jq -r --arg part "$part" '
-      .items[]? | select(.fullPath | startswith("/" + $part + "/")) | .name
+      .items[]
+      | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
+      | .name
     ' "$TMP_POOL" | xargs)
     [ -z "$pools_in_part" ] && pools_in_part="(aucun)"
   fi
@@ -97,7 +95,7 @@ jq -r '
 
   if (( DEBUG )); then
     echo "[DEBUG] VS=$vs_path pool=$vs_pool ssl=$ssl_name C3D=$c3d_status"
-    echo "[DEBUG] Pools mêmes partition: $pools_in_part"
+    echo "[DEBUG] Pools même partition: $pools_in_part"
   fi
 done
 
