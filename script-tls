@@ -1,6 +1,6 @@
 #!/bin/bash
-# Détection des VS avec C3D activé sur le profil serveur SSL (via iControl REST)
-# Connexion locale sur port 8100 en HTTP (admin: sans mot de passe)
+# Lister tous les VS (toutes partitions) et vérifier C3D sur leurs profils server-ssl.
+# Connexion locale iControl REST (HTTP 8100) avec admin: (sans mot de passe).
 
 set -euo pipefail
 
@@ -8,11 +8,11 @@ F5_URL="http://localhost:8100"
 AUTH="admin:"
 TMP_VS=$(mktemp)
 TMP_SSL=$(mktemp)
-
 trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-echo "[INFO] Récupération des VS..."
-curl -sS --insecure -u "$AUTH" "$F5_URL/mgmt/tm/ltm/virtual" -o "$TMP_VS"
+echo "[INFO] Récupération des VS (toutes partitions)..."
+curl -sS --insecure -u "$AUTH" \
+  "$F5_URL/mgmt/tm/ltm/virtual?recursive=true" -o "$TMP_VS"
 
 # Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
@@ -21,9 +21,9 @@ if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
   exit 1
 fi
 
-printf "%-30s %-40s %-30s %-10s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
+printf "%-25s %-40s %-30s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 
-# Liste tous les VS qui ont un profil server-ssl
+# Parcours de chaque VS
 jq -r '.items[] | select(.profilesReference.items != null) |
        {vs: .fullPath, profiles: [.profilesReference.items[].fullPath]} |
        @base64' "$TMP_VS" | while read -r vs_enc; do
@@ -35,25 +35,25 @@ jq -r '.items[] | select(.profilesReference.items != null) |
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  # Filtrer les profils server-ssl uniquement
+  # Pour chaque profil, on cherche ceux de type server-ssl
   for p in $profiles; do
     if [[ "$p" == *"/"*server-ssl* || "$p" == *server-ssl* ]]; then
       profile_name="${p##*/}"
-      echo "[DEBUG] VS $vs_name -> server-ssl: $profile_name" >&2
 
-      # Lecture du profil server-ssl
+      # Lecture du profil server-ssl (dans sa partition d'origine)
       curl -sS --insecure -u "$AUTH" \
         "$F5_URL/mgmt/tm/ltm/profile/server-ssl/~$part~$profile_name" -o "$TMP_SSL" || continue
 
-      # Vérifie C3D activé : paramètre clientCertCA / c3dCA / c3dCaCerts
+      # Déterminer si C3D est actif
       c3d_status="OFF"
-      if jq -e '(.clientCertCA != null and .clientCertCA != "none") or
-                (.c3dCA != null and .c3dCA != "none") or
-                (.c3dCaCerts != null and .c3dCaCerts != "none")' >/dev/null 2>&1 <"$TMP_SSL"; then
+      if jq -e '(.clientCertCA != null and .clientCertCA != "none")
+             or (.c3dCA != null and .c3dCA != "none")
+             or (.c3dCaCerts != null and .c3dCaCerts != "none")
+             or (.c3d != null and .c3d != "none")' >/dev/null 2>&1 <"$TMP_SSL"; then
         c3d_status="ON"
       fi
 
-      printf "%-30s %-40s %-30s %-10s\n" "$part" "$vs_name" "$profile_name" "$c3d_status"
+      printf "%-25s %-40s %-30s %-8s\n" "$part" "$vs_name" "$profile_name" "$c3d_status"
     fi
   done
 done
