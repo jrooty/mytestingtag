@@ -1,6 +1,6 @@
 #!/bin/bash
-# Lister tous les VS (toutes partitions) et vérifier C3D sur leurs profils server-ssl.
-# Connexion locale iControl REST (HTTP 8100) avec admin: (sans mot de passe).
+# Détecte les VS HTTPS (toutes partitions) avec C3D activé sur leur profil server-ssl
+# via iControl REST local (HTTP:8100) avec admin: sans mot de passe
 
 set -euo pipefail
 
@@ -10,46 +10,53 @@ TMP_VS=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-echo "[INFO] Récupération des VS (toutes partitions)..."
-curl -sS --insecure -u "$AUTH" \
-  "$F5_URL/mgmt/tm/ltm/virtual?recursive=true" -o "$TMP_VS"
+echo "[INFO] Récupération des VS sur toutes les partitions..."
+curl -sS --insecure -u "$AUTH" "$F5_URL/mgmt/tm/ltm/virtual?recursive=true" -o "$TMP_VS"
 
 # Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non valide JSON"
+  echo "[ERR] Réponse non valide JSON, extrait :"
   head -n 20 "$TMP_VS"
   exit 1
 fi
 
 printf "%-25s %-40s %-30s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
 
-# Parcours de chaque VS
-jq -r '.items[] | select(.profilesReference.items != null) |
-       {vs: .fullPath, profiles: [.profilesReference.items[].fullPath]} |
-       @base64' "$TMP_VS" | while read -r vs_enc; do
+# 🔹 Parcours sécurisé : ignorer VS sans profils
+jq -r '
+  .items[]? |
+  . as $vs |
+  select($vs.profilesReference.items != null) |
+  {
+    vs: $vs.fullPath,
+    profiles: ($vs.profilesReference.items | map(.fullPath) | join(" "))
+  } | @base64
+' "$TMP_VS" | while read -r vs_enc; do
 
   _jq() { echo "$vs_enc" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
-  profiles=$(_jq '.profiles | join(" ")')
+  profiles=$(_jq '.profiles')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  # Pour chaque profil, on cherche ceux de type server-ssl
+  # Recherche de profils server-ssl
   for p in $profiles; do
-    if [[ "$p" == *"/"*server-ssl* || "$p" == *server-ssl* ]]; then
+    if [[ "$p" == *server-ssl* ]]; then
       profile_name="${p##*/}"
 
-      # Lecture du profil server-ssl (dans sa partition d'origine)
+      # Lecture du profil server-ssl (GET)
       curl -sS --insecure -u "$AUTH" \
         "$F5_URL/mgmt/tm/ltm/profile/server-ssl/~$part~$profile_name" -o "$TMP_SSL" || continue
 
-      # Déterminer si C3D est actif
+      # Vérifie les champs potentiels C3D
       c3d_status="OFF"
-      if jq -e '(.clientCertCA != null and .clientCertCA != "none")
-             or (.c3dCA != null and .c3dCA != "none")
-             or (.c3dCaCerts != null and .c3dCaCerts != "none")
-             or (.c3d != null and .c3d != "none")' >/dev/null 2>&1 <"$TMP_SSL"; then
+      if jq -e '
+          (.clientCertCA != null and .clientCertCA != "none") or
+          (.c3dCA != null and .c3dCA != "none") or
+          (.c3dCaCerts != null and .c3dCaCerts != "none") or
+          (.c3d != null and .c3d != "none")
+        ' >/dev/null 2>&1 <"$TMP_SSL"; then
         c3d_status="ON"
       fi
 
