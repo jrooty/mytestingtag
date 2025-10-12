@@ -1,7 +1,7 @@
 #!/bin/bash
 # Audit des VS avec C3D activé → liste les pools + pool members (IP:port)
+# Compatible jq minimal (pas de regex, pas de //)
 # HTTP 8100, admin:
-# Compatible jq minimal F5
 # Options :
 #   --debug      → logs détaillés
 #   --c3d-only   → n'affiche que les VS avec C3D=ON
@@ -75,7 +75,7 @@ jq -r '
           link="$BASE$link"
         fi
         curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" || continue
-        sslC3d=$(jq -r '.sslC3d // empty' <"$TMP_SSL")
+        sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
         lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
         if [[ "$lower" == "enabled" ]]; then
           c3d_status="ON"
@@ -105,21 +105,17 @@ jq -r '
     _p() { echo "$pool_row" | base64 --decode | jq -r "$1"; }
     pool_name=$(_p '.pool')
 
-    # Extraction IP:PORT robuste
+    # Extraction IP:PORT sans regex
     members=$(_p '.members | map(
-      if (.address != null and .address != "") then
-         (.address + ":" +
-           (if (.port != null and .port != 0) then (.port|tostring)
-            else (if (.name|test(":")) then (.name|split(":")[1]) else "unknown" end)
-            end))
-      elif (.addr != null and .addr != "") then
-         (.addr + ":" +
-           (if (.port != null and .port != 0) then (.port|tostring)
-            else (if (.name|test(":")) then (.name|split(":")[1]) else "unknown" end)
-            end))
-      elif (.name|test(":")) then .name
-      else .name + ":unknown"
-      end
+      (if (.address != null and .address != "") then .address
+       elif (.addr != null and .addr != "") then .addr
+       else (if (.name|split(":")|length>1) then (.name|split(":")[0]) else .name end)
+       end)
+      + ":" +
+      (if (.port != null and .port != 0)
+        then (.port|tostring)
+        else (if (.name|split(":")|length>1) then (.name|split(":")[1]) else "unknown" end)
+       end)
     ) | join(" ")')
 
     if [ -z "$members" ]; then
