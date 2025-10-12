@@ -1,110 +1,116 @@
 #!/bin/bash
-# Audit des Virtual Servers BIG-IP (local HTTP 8100)
-# Détection des profils server-ssl et du statut C3D
-# Un appel principal expandSubcollections + suivi des liens HTTP:8100
-# Compatible jq sans regex, option --debug
+# Audit VS BIG-IP (HTTP 8100, admin:)
+# - Un seul GET principal avec expandSubcollections=true
+# - Suivi des liens "server-ssl" (nameReference.link) seulement
+# - Réécriture des URLs en http://localhost:8100/...
+# - Affiche le code HTTP des appels profil
+# - C3D détecté via le champ "sslC3d" uniquement
+# - Mode --debug pour voir les liens suivis
 
 set -euo pipefail
 
 DEBUG=0
 [[ "${1:-}" == "--debug" ]] && DEBUG=1
 
-# --- paramètres F5 locaux ---
 F5_HOST="localhost:8100"
-F5_BASE="http://$F5_HOST"
-F5_URL="$F5_BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
-AUTH="admin:"
+BASE="http://$F5_HOST"
+AUTH="admin:"                           # user:pass (pass vide)
+VS_URL="$BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
 
-TMP_VS=$(mktemp)
-TMP_SSL=$(mktemp)
+TMP_VS="$(mktemp)"
+TMP_SSL="$(mktemp)"
 trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-echo "[INFO] Lecture des Virtual Servers sur $F5_HOST ..."
-curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
+echo "[INFO] GET $VS_URL"
+curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 
-# Vérifie JSON
+# Vérif JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
-  echo "[ERR] Réponse non JSON. Extrait :"
-  head -n 20 "$TMP_VS"
+  echo "[ERR] Réponse non JSON. Extrait :" >&2
+  head -n 40 "$TMP_VS" >&2
   exit 1
 fi
 
-printf "\n%-25s %-40s %-35s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
-printf "%s\n" "──────────────────────────────────────────────────────────────────────────────────────────────"
+printf "\n%-25s %-40s %-35s %-6s %-3s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "HTTP"
+printf "%s\n" "──────────────────────────────────────────────────────────────────────────────────────────────────────"
 
-# Boucle sur les VS
+# Boucle VS
 jq -r '
   .items[]? |
   {
     vs: .fullPath,
     profiles: (.profilesReference.items // [])
   } | @base64
-' "$TMP_VS" | while read -r vs_enc; do
-  _jq() { echo "$vs_enc" | base64 --decode | jq -r "$1"; }
+' "$TMP_VS" | while read -r row; do
+  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
 
   vs_path=$(_jq '.vs')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
-  c3d_status="-"
+  c3d="-"           # ON/OFF/-
+  http_code="-"     # code HTTP du GET profil
 
   profiles_json=$(_jq '.profiles')
 
-  if (( DEBUG )); then
+  (( DEBUG )) && {
     echo -e "\n[DEBUG] VS: $vs_path"
     echo "$profiles_json" | jq -r '.[]?.name'
-  fi
+  }
 
   count=$(echo "$profiles_json" | jq 'length')
   if [ "$count" -gt 0 ]; then
-    for idx in $(seq 0 $((count - 1))); do
+    for idx in $(seq 0 $((count-1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name // empty")
-      ctx=$(echo "$profiles_json" | jq -r ".[$idx].context // empty")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
-
-      # Détection profil server-ssl
+      # On ne s'intéresse qu'aux profils server-ssl
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
 
-        # Construction du lien HTTP 8100 si incomplet
-        if [[ "$link" != http* ]]; then
-          link="$F5_BASE$link"
+        # Uniformiser lien en HTTP:8100 local
+        if [[ "$link" == http* ]]; then
+          # remplacer https://localhost (ou http://localhost) par http://localhost:8100
+          link=$(echo "$link" | sed -e 's#https://localhost#http://localhost:8100#g' \
+                                    -e 's#http://localhost$#http://localhost:8100#g' \
+                                    -e 's#http://localhost/#http://localhost:8100/#g')
         else
-          # remplace https://localhost par http://localhost:8100 si besoin
-          link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
+          link="$BASE${link}"
         fi
 
-        if (( DEBUG )); then
-          echo "[DEBUG] -> Profil server-ssl trouvé : $ssl_name (context=$ctx)"
-          echo "[DEBUG] -> Lien HTTP suivi : $link"
-        fi
+        (( DEBUG )) && {
+          echo "[DEBUG] -> server-ssl: $ssl_name"
+          echo "[DEBUG] -> GET profil : $link"
+        }
 
-        # Lecture du profil SSL
-        curl -sS --insecure -u "$AUTH" "$link" -o "$TMP_SSL" 2>/dev/null || continue
+        # GET du profil et capture code HTTP
+        http_code=$(curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" -w "%{http_code}" "$link" || echo "000")
 
-        # Vérifie les champs C3D
-        c3d_status="OFF"
-        if jq -e '
-          (.clientCertCA != null and .clientCertCA != "none")
-          or (.c3dCA != null and .c3dCA != "none")
-          or (.c3dCaCerts != null and .c3dCaCerts != "none")
-          or (.c3d != null and .c3d != "none")
-        ' >/dev/null 2>&1 <"$TMP_SSL"; then
-          c3d_status="ON"
-        fi
-
-        if (( DEBUG )); then
-          echo "[DEBUG] -> Champs C3D du profil :"
-          jq -r '{clientCertCA, c3dCA, c3dCaCerts, c3d}' <"$TMP_SSL"
-          echo "[DEBUG] -> Statut C3D : $c3d_status"
+        # Par défaut OFF si appel ok ; sinon reste "-"
+        c3d="-"
+        if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
+          # Détection C3D via sslC3d uniquement
+          # ON si sslC3d existe et != "disabled"/"none" (insensible casse côté bash)
+          raw=$(jq -r '.sslC3d // ""' <"$TMP_SSL")
+          lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+          if [[ -n "$raw" && "$lower" != "disabled" && "$lower" != "none" ]]; then
+            c3d="ON"
+          else
+            c3d="OFF"
+          fi
+          (( DEBUG )) && {
+            echo "[DEBUG] -> sslC3d: ${raw:-"(absent)"}"
+            echo "[DEBUG] -> C3D: $c3d   HTTP: $http_code"
+          }
+        else
+          (( DEBUG )) && echo "[DEBUG] -> Appel profil NON 2xx (HTTP=$http_code)"
         fi
         break
       fi
     done
   fi
 
-  printf "%-25s %-40s %-35s %-8s\n" "$part" "$vs_name" "$ssl_name" "$c3d_status"
+  printf "%-25s %-40s %-35s %-6s %-3s\n" "$part" "$vs_name" "$ssl_name" "$c3d" "$http_code"
 done
 
-echo -e "\n[INFO] Audit terminé sur $F5_HOST."
+echo -e "\n[INFO] Terminé."
