@@ -1,22 +1,24 @@
 #!/bin/bash
-# Audit complet des Virtual Servers avec expandSubcollections=true
-# Détection des profils server-ssl et C3D actif
-# Compatible jq sans regex (F5), un seul appel REST, mode debug optionnel
+# Audit complet des Virtual Servers (HTTP 8100, admin:)
+# Un seul appel principal (expandSubcollections=true)
+# + suivi des liens "nameReference.link" pour profils server-ssl (optimisé)
+# Compatible jq sans regex, option --debug
 
 set -euo pipefail
 
 DEBUG=0
 [[ "${1:-}" == "--debug" ]] && DEBUG=1
 
-F5_URL="http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true"
+F5_BASE="http://localhost:8100"
+F5_URL="$F5_BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
 AUTH="admin:"
 TMP_VS=$(mktemp)
-trap 'rm -f "$TMP_VS"' EXIT
+TMP_SSL=$(mktemp)
+trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
 echo "[INFO] Lecture des Virtual Servers (expandSubcollections=true)..."
 curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
 
-# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
   echo "[ERR] Réponse non JSON. Extrait :"
   head -n 20 "$TMP_VS"
@@ -56,32 +58,36 @@ jq -r '
       ctx=$(echo "$profiles_json" | jq -r ".[$idx].context // empty")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
 
+      # Détection d’un profil server-ssl
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
+        [[ "$link" != http* ]] && link="$F5_BASE$link"  # s'assurer que le lien est complet
 
         if (( DEBUG )); then
           echo "[DEBUG] -> Profil server-ssl trouvé : $ssl_name (context=$ctx)"
-          echo "[DEBUG] -> Lien : $link"
+          echo "[DEBUG] -> Lien complet : $link"
         fi
 
-        # Lecture du contenu du profil déjà expandu (même JSON)
-        c3d_status=$(jq -r --arg VS "$vs_path" --arg SSL "$ssl_name" '
-          .items[]
-          | select(.fullPath == $VS)
-          | .profilesReference.items[]
-          | select(.name == $SSL)
-          | if ((.clientCertCA? // "") != "none" and .clientCertCA != null)
-            or ((.c3dCA? // "") != "none" and .c3dCA != null)
-            or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
-            or ((.c3d? // "") != "none" and .c3d != null)
-            then "ON"
-            else "OFF"
-            end
-        ' "$TMP_VS")
+        # Lecture du profil SSL via son lien dédié
+        curl -sS --insecure -u "$AUTH" "$link" -o "$TMP_SSL" 2>/dev/null || continue
+
+        # Vérifie les champs C3D
+        c3d_status="OFF"
+        if jq -e '
+          (.clientCertCA != null and .clientCertCA != "none")
+          or (.c3dCA != null and .c3dCA != "none")
+          or (.c3dCaCerts != null and .c3dCaCerts != "none")
+          or (.c3d != null and .c3d != "none")
+        ' >/dev/null 2>&1 <"$TMP_SSL"; then
+          c3d_status="ON"
+        fi
 
         if (( DEBUG )); then
-          echo "[DEBUG] -> C3D check : $c3d_status"
+          echo "[DEBUG] -> Champs C3D du profil :"
+          jq -r '{clientCertCA, c3dCA, c3dCaCerts, c3d}' <"$TMP_SSL"
+          echo "[DEBUG] -> Statut C3D : $c3d_status"
         fi
+
         break
       fi
     done
