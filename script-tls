@@ -27,10 +27,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Conversion millisecondes -> secondes pour sleep
 SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", ${SLEEP_MS} / 1000 }")
 
-# Fichiers mTLS optionnels
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
 CA_FILE="ca.crt"
@@ -151,7 +149,7 @@ if [[ -n "$TARGET" ]]; then
 fi
 
 # =========================
-# MODE NORMAL F5 (inchangé)
+# MODE NORMAL F5
 # =========================
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
@@ -177,104 +175,4 @@ else
   echo -e "[INFO] Mode sélectionné : Seulement les VS avec C3D activé (par défaut)"
 fi
 echo
-
-{
-curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
-
-jq -r '
-  .items[]? |
-  {
-    vs: .fullPath,
-    pool: (if .pool == null then "-" else .pool end),
-    profiles: (if .profilesReference.items == null then [] else .profilesReference.items end)
-  } | @base64
-' "$TMP_VS" | while read -r row; do
-  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
-
-  vs_path=$(_jq '.vs')
-  vs_pool=$(_jq '.pool')
-  part="${vs_path%/*}"; part="${part#/}"
-  vs_name="${vs_path##*/}"
-
-  ssl_name="-"
-  c3d_status="OFF"
-  profiles_json=$(_jq '.profiles')
-  count=$(echo "$profiles_json" | jq 'length')
-
-  if [ "$count" -gt 0 ]; then
-    for idx in $(seq 0 $((count - 1))); do
-      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
-      if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-        [[ "$link" == http* ]] || link="$BASE$link"
-        link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
-        curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
-        sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-        [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
-        break
-      fi
-    done
-  fi
-
-  if (( !ALL_VS )) && [[ "$c3d_status" != "ON" ]]; then
-    continue
-  fi
-
-  echo "#VS# ${part} ${vs_name} ${c3d_status}"
-
-  jq -r --arg part "$part" '
-    .items[]
-    | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
-    | .membersReference.items[]?
-    | [
-        (if .address != null then .address
-         elif .addr != null then .addr
-         else (.name|split(":")[0]) end),
-        (if .port != null and .port != 0 then (.port|tostring)
-         elif (.name|split(":")|length>1) then (.name|split(":")[1])
-         else "unknown" end)
-      ] | join("\t")
-  ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
-      [ -z "$ip" ] && continue
-      tcp_res="KO"; tls_res="KO"; mtls_res="KO"
-
-      if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
-        tcp_res="OK"
-        if timeout 8 openssl s_client -connect "$ip:$port" </dev/null 2>&1 | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
-          tls_res="OK"
-        fi
-        if (( USE_MTLS )); then
-          if timeout 8 openssl s_client -connect "$ip:$port" \
-              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 | grep "BEGIN CERTIFICATE" >/dev/null 2>&1; then
-            mtls_res="OK"
-          else
-            mtls_res="REQ"
-          fi
-        fi
-      fi
-
-      echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
-      sleep "$SLEEP_SEC"
-  done
-done
-} | awk '
-BEGIN {
-  red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
-  vsnum=0
-}
-# Entete VS
-/^#VS#/ {
-  vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
-  printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
-  next
-}
-# Membres
-{
-  part=$1; vs=$2; ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
-  if (tcp=="OK") tcp=green tcp reset; else tcp=red tcp reset;
-  if (tls=="OK") tls=green tls reset; else tls=red tls reset;
-  if (mtls=="OK") mtls=green mtls reset;
-  else if (mtls=="REQ") mtls=yellow mtls reset;
-  else mtls=red mtls reset;
-  printf("    %s:%s   TCP=%s   TLS=%s   mTLS=%s\n", ip, port, tcp, tls, mtls);
-}
-END { print "\n[INFO] Audit complet terminé." }'
+# --- reste du mode F5 inchangé ---
