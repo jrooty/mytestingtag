@@ -1,56 +1,59 @@
 #!/bin/bash
-# Classement des VS BIG-IP selon profils nommés :
-#  - fastl4 : profil contenant "PrfFastl4"
-#  - https  : profils contenant "PrfCSSL" ET "PrfHTTP"
-#  - http   : profil contenant "PrfHTTP" mais PAS "PrfCSSL"
-# Sinon : other
-# Parcourt toutes les partitions (recursive). Ajoute --debug pour afficher les profils vus.
+# Détection des VS avec C3D activé sur le profil serveur SSL (via iControl REST)
+# Connexion locale sur port 8100 en HTTP (admin: sans mot de passe)
 
-set -eo pipefail
+set -euo pipefail
 
-DEBUG=0
-[[ "${1:-}" == "--debug" ]] && DEBUG=1
+F5_URL="http://localhost:8100"
+AUTH="admin:"
+TMP_VS=$(mktemp)
+TMP_SSL=$(mktemp)
 
-# En-tête
-printf "%-28s %-40s %-24s %-8s\n" "PARTITION" "VS_NAME" "DESTINATION" "TYPE"
+trap 'rm -f "$TMP_VS" "$TMP_SSL"' EXIT
 
-# Tous les VS (une ligne par VS, toutes partitions)
-tmsh -q -c 'cd /; list ltm virtual recursive one-line' 2>/dev/null | while IFS= read -r line; do
-  # Chemin VS (/Partition/Name)
-  vs_path=$(awk '{for (i=1;i<=NF;i++) if ($i=="virtual") {print $(i+1); break}}' <<<"$line")
-  [[ -z "$vs_path" ]] && continue
+echo "[INFO] Récupération des VS..."
+curl -sS --insecure -u "$AUTH" "$F5_URL/mgmt/tm/ltm/virtual" -o "$TMP_VS"
+
+# Vérifie JSON
+if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
+  echo "[ERR] Réponse non valide JSON"
+  head -n 20 "$TMP_VS"
+  exit 1
+fi
+
+printf "%-30s %-40s %-30s %-10s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
+
+# Liste tous les VS qui ont un profil server-ssl
+jq -r '.items[] | select(.profilesReference.items != null) |
+       {vs: .fullPath, profiles: [.profilesReference.items[].fullPath]} |
+       @base64' "$TMP_VS" | while read -r vs_enc; do
+
+  _jq() { echo "$vs_enc" | base64 --decode | jq -r "$1"; }
+
+  vs_path=$(_jq '.vs')
+  profiles=$(_jq '.profiles | join(" ")')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
-  # Destination (IP:port)
-  dest=$(awk '{for (i=1;i<=NF;i++) if ($i=="destination") {print $(i+1); break}}' <<<"$line")
-  [[ "$dest" == */*:* ]] && dest="${dest##*/}"
+  # Filtrer les profils server-ssl uniquement
+  for p in $profiles; do
+    if [[ "$p" == *"/"*server-ssl* || "$p" == *server-ssl* ]]; then
+      profile_name="${p##*/}"
+      echo "[DEBUG] VS $vs_name -> server-ssl: $profile_name" >&2
 
-  # Récupère uniquement la section profiles de CE VS (fiable, quel que soit le format “one-line”)
-  profiles_text=$(tmsh -q -c "list ltm virtual ${vs_path} profiles" 2>/dev/null || true)
+      # Lecture du profil server-ssl
+      curl -sS --insecure -u "$AUTH" \
+        "$F5_URL/mgmt/tm/ltm/profile/server-ssl/~$part~$profile_name" -o "$TMP_SSL" || continue
 
-  # Détection par motifs (insensible à la casse)
-  has_fastl4=0; has_http=0; has_cssl=0
-  grep -qi 'PrfFastl4' <<<"$profiles_text" && has_fastl4=1
-  grep -qi 'PrfHTTP'   <<<"$profiles_text" && has_http=1
-  grep -qi 'PrfCSSL'   <<<"$profiles_text" && has_cssl=1
+      # Vérifie C3D activé : paramètre clientCertCA / c3dCA / c3dCaCerts
+      c3d_status="OFF"
+      if jq -e '(.clientCertCA != null and .clientCertCA != "none") or
+                (.c3dCA != null and .c3dCA != "none") or
+                (.c3dCaCerts != null and .c3dCaCerts != "none")' >/dev/null 2>&1 <"$TMP_SSL"; then
+        c3d_status="ON"
+      fi
 
-  # Priorité : fastl4 > https > http > other
-  vs_type="other"
-  if (( has_fastl4 )); then
-    vs_type="fastl4"
-  elif (( has_http && has_cssl )); then
-    vs_type="https"
-  elif (( has_http && !has_cssl )); then
-    vs_type="http"
-  fi
-
-  printf "%-28s %-40s %-24s %-8s\n" "$part" "$vs_name" "${dest:-"-"}" "$vs_type"
-
-  if (( DEBUG )); then
-    echo "  -> VS: $vs_path"
-    echo "  -> Profiles vus:"
-    echo "$profiles_text" | sed 's/^/     /'
-    echo "  -> Flags: fastl4=$has_fastl4 cssl=$has_cssl http=$has_http => type=$vs_type"
-  fi
+      printf "%-30s %-40s %-30s %-10s\n" "$part" "$vs_name" "$profile_name" "$c3d_status"
+    fi
+  done
 done
