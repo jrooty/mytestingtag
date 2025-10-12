@@ -1,7 +1,6 @@
 #!/bin/bash
 # Audit complet VS C3D + test TCP / TLS / mTLS sur les pool members
-# Version finale : logique inchangée, comptage au début, formatage coloré
-# HTTP 8100, admin:
+# Version : inchangée (structure d'origine) + comptage au début et à la fin
 
 set -euo pipefail
 
@@ -14,7 +13,7 @@ for arg in "$@"; do
   esac
 done
 
-# Couleurs pour AWK
+# Couleurs pour l'affichage final
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
 
 CLIENT_CERT="client.crt"
@@ -34,12 +33,10 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
-# ---- Phase 0 : comptage des VS avant tout ----
+# ---- Comptage global avant exécution principale ----
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS" >/dev/null 2>&1 || true
-
 total_vs=$(jq -r '.items | length' "$TMP_VS" 2>/dev/null || echo 0)
 total_c3d_on=0
-
 for link in $(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null || true); do
   if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
     [[ "$link" == http* ]] || link="$BASE$link"
@@ -49,11 +46,10 @@ for link in $(jq -r '.items[].profilesReference.items[].nameReference.link?' "$T
     [[ "${sslC3d,,}" == "enabled" ]] && ((total_c3d_on++))
   fi
 done
-
 echo -e "\n[INFO] Nombre total de Virtual Servers détectés : ${total_vs}"
 echo -e "[INFO] Nombre de Virtual Servers avec C3D activé : ${total_c3d_on}\n"
 
-# ---- Phase 1 : exécution inchangée du script ----
+# ---- Script d'origine (aucune modif de structure) ----
 {
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL" >/dev/null 2>&1 || true
 
@@ -80,23 +76,13 @@ jq -r '
 
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
-      name=$(echo "$profiles_json" | jq -r ".[$idx].name")
       link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
-
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-        ssl_name="$name"
-        if [[ "$link" == http* ]]; then
-          link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
-        else
-          link="$BASE$link"
-        fi
+        [[ "$link" == http* ]] || link="$BASE$link"
+        link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
         curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
         sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-        lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
-        if [[ "$lower" == "enabled" ]]; then
-          c3d_status="ON"
-        fi
-        (( DEBUG )) && echo "[DEBUG] VS=$vs_name profil=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
+        [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
         break
       fi
     done
@@ -138,7 +124,6 @@ jq -r '
           fi
         fi
       fi
-
       echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
   done
 done
@@ -147,7 +132,7 @@ BEGIN {
   red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
   vsnum=0; c3d_on=0
 }
-# Entête VS
+# Détection VS
 /^#VS#/ {
   vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
   if (c3d=="ON") c3d_on++;
