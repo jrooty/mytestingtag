@@ -1,24 +1,24 @@
 #!/bin/bash
 # Audit complet VS + test TCP / TLS / mTLS sur les pool members
-# Version stable + délai configurable entre tests des members
+# Version stable + délai configurable + logique inversée (--all-vs)
 
 set -euo pipefail
 
 DEBUG=0
-FILTER_C3D_ONLY=0
-SLEEP_MS=200  # Valeur par défaut : 200 ms
+ALL_VS=0
+SLEEP_MS=200  # Délai par défaut : 200 ms
 
 for arg in "$@"; do
   case "$arg" in
     --debug) DEBUG=1 ;;
-    --c3d-only) FILTER_C3D_ONLY=1 ;;
+    --all-vs) ALL_VS=1 ;;
     --sleep-ms=*)
       SLEEP_MS="${arg#*=}"
       ;;
   esac
 done
 
-# Conversion en secondes pour sleep
+# Conversion millisecondes → secondes
 SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", $SLEEP_MS / 1000 }")
 
 CLIENT_CERT="client.crt"
@@ -38,7 +38,7 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
-# ---- Préparation comptage ----
+# ---- Comptage initial ----
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 total_vs=$(jq -r '.items | length' "$TMP_VS" 2>/dev/null || echo 0)
 total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null \
@@ -46,7 +46,13 @@ total_ssl=$(jq -r '.items[].profilesReference.items[].nameReference.link?' "$TMP
 
 echo -e "\n[INFO] Nombre total de Virtual Servers : ${total_vs}"
 echo -e "[INFO] Nombre de Virtual Servers avec profil server-ssl : ${total_ssl}"
-echo -e "[INFO] Délai entre tests de membres : ${SLEEP_MS} ms\n"
+echo -e "[INFO] Délai entre tests de membres : ${SLEEP_MS} ms"
+if (( ALL_VS )); then
+  echo -e "[INFO] Mode sélectionné : Tous les Virtual Servers (--all-vs)"
+else
+  echo -e "[INFO] Mode sélectionné : Seulement les VS avec C3D activé (par défaut)"
+fi
+echo
 
 # ---- Script principal inchangé ----
 {
@@ -85,7 +91,8 @@ jq -r '
     done
   fi
 
-  if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
+  # 🧠 logique inversée : on garde par défaut uniquement les VS C3D=ON
+  if (( !ALL_VS )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
 
@@ -124,7 +131,7 @@ jq -r '
 
       echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
 
-      # 💤 délai configurable entre deux tests
+      # 💤 Délai configurable
       sleep "$SLEEP_SEC"
   done
 done
