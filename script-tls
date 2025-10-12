@@ -23,32 +23,44 @@ USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
 echo "[INFO] Connexion à $IP:$PORT (SNI=$SNI)"
-tcp_res="KO"; tls_res="KO"; mtls_res="KO"
+tcp_res="KO"; tls_res="KO"; mtls_res="N/A"
 
 # ---------- test TCP ----------
 if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
   tcp_res="OK"
+
   # ---------- test TLS ----------
   if openssl s_client -connect "$IP:$PORT" -servername "$SNI" -showcerts </dev/null 2>&1 | grep -q "BEGIN CERTIFICATE"; then
     tls_res="OK"
   fi
+
   # ---------- test mTLS ----------
   if (( USE_MTLS )); then
+    # Test mTLS réel
     if openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
          -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 | grep -q "BEGIN CERTIFICATE"; then
       mtls_res="OK"
     else
       mtls_res="REQ"
     fi
+  else
+    # Vérifie si le serveur demande un cert client
+    if openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 | grep -q "Acceptable client certificate CA names"; then
+      mtls_res="REQ"
+    else
+      mtls_res="N/A"
+    fi
   fi
 fi
 
+# ---------- affichage résultats ----------
 GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; RESET="\033[0m"
 [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
 [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
 case "$mtls_res" in
   OK) mtls_col="${GREEN}OK${RESET}" ;;
   REQ) mtls_col="${YELLOW}REQ${RESET}" ;;
+  N/A) mtls_col="${RED}N/A${RESET}" ;;
   *) mtls_col="${RED}KO${RESET}" ;;
 esac
 
@@ -74,7 +86,7 @@ if [[ "$tls_res" == "OK" ]]; then
   echo
 fi
 
-# ---------- CA acceptées (annoncées par le serveur) ----------
+# ---------- CA acceptées ----------
 echo "[INFO] CA acceptées par le serveur (si fournies) :"
 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
   | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
