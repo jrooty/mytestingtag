@@ -1,11 +1,11 @@
 #!/bin/bash
-# Audit des Virtual Servers avec détection C3D réelle (suivi du profil server-ssl)
+# Audit des VS avec C3D activé → liste les pools + pool members (même partition)
+# Compatible jq minimal (F5)
 # HTTP 8100, admin:
-# 1 appel expand VS + 1 appel expand Pools
-# Vérifie sslC3d dans chaque profil server-ssl (via curl dédié)
+# Un seul appel expandSubcollections pour VS et Pools
 # Options :
 #   --debug      → logs détaillés
-#   --c3d-only   → n'affiche que les VS avec C3D=ON
+#   --c3d-only   → ne liste que les VS avec C3D=ON
 
 set -euo pipefail
 
@@ -19,11 +19,9 @@ for arg in "$@"; do
   esac
 done
 
-# --- Connexion locale F5 ---
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
-
 VS_URL="$BASE/mgmt/tm/ltm/virtual?expandSubcollections=true"
 POOL_URL="$BASE/mgmt/tm/ltm/pool?expandSubcollections=true"
 
@@ -35,20 +33,11 @@ trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 echo "[INFO] Lecture des Virtual Servers..."
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 
-echo "[INFO] Lecture des Pools..."
+echo "[INFO] Lecture des Pools et de leurs membres..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-# Vérifie JSON minimalement
-for file in "$TMP_VS" "$TMP_POOL"; do
-  if ! jq -e . >/dev/null 2>&1 <"$file"; then
-    echo "[ERR] Fichier JSON invalide : $file"
-    head -n 20 "$file"
-    exit 1
-  fi
-done
-
 printf "\n%-25s %-40s %-35s %-8s %-40s\n" \
-  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOLS_ASSOCIÉS"
+  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_MEMBERS"
 printf "%s\n" \
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
@@ -74,6 +63,7 @@ jq -r '
   profiles_json=$(_jq '.profiles')
   count=$(echo "$profiles_json" | jq 'length')
 
+  # Recherche du profil server-ssl → lecture directe pour sslC3d
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name")
@@ -81,27 +71,19 @@ jq -r '
 
       if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-
-        # Convertit le lien pour HTTP 8100 local
+        # Conversion du lien pour HTTP local
         if [[ "$link" == http* ]]; then
           link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
         else
           link="$BASE$link"
         fi
-
-        (( DEBUG )) && echo "[DEBUG] Lecture profil SSL : $link"
-        curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" -w "" "$link" || continue
-
+        curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" || continue
         sslC3d=$(jq -r '.sslC3d // empty' <"$TMP_SSL")
         lower=$(echo "$sslC3d" | tr '[:upper:]' '[:lower:]')
-
         if [[ "$lower" == "enabled" ]]; then
           c3d_status="ON"
         fi
-
-        if (( DEBUG )); then
-          echo "[DEBUG] Profil=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
-        fi
+        (( DEBUG )) && echo "[DEBUG] VS=$vs_name profil=$ssl_name sslC3d=$sslC3d → C3D=$c3d_status"
         break
       fi
     done
@@ -112,26 +94,32 @@ jq -r '
     continue
   fi
 
-  # Récupère tous les pools de la même partition
-  pools_in_part=$(jq -r --arg part "$part" '
+  # Recherche des pools dans la même partition + leurs membres
+  pools_json=$(jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
-    | .name
+    | {pool: .name, members: (if .membersReference.items == null then [] else .membersReference.items end)}
+    | @base64
   ' "$TMP_POOL")
 
-  if [ -z "$pools_in_part" ]; then
-    pools_in_part="(aucun)"
-  else
-    pools_in_part=$(echo "$pools_in_part" | tr '\n' ' ' | sed 's/ *$//')
-  fi
+  pool_members_display=""
+  while read -r pool_row; do
+    [ -z "$pool_row" ] && continue
+    _p() { echo "$pool_row" | base64 --decode | jq -r "$1"; }
+    pool_name=$(_p '.pool')
+    members=$(_p '.members | map(.name) | join(" ")')
+    if [ -z "$members" ]; then
+      members="(aucun membre)"
+    fi
+    pool_members_display+="[$pool_name: $members] "
+  done <<< "$pools_json"
+
+  [ -z "$pool_members_display" ] && pool_members_display="(aucun pool)"
+  pool_members_display=$(echo "$pool_members_display" | sed 's/ *$//')
 
   printf "%-25s %-40s %-35s %-8s %-40s\n" \
-    "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pools_in_part"
+    "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pool_members_display"
 
-  if (( DEBUG )); then
-    echo "[DEBUG] VS=$vs_path pool=$vs_pool ssl=$ssl_name C3D=$c3d_status"
-    echo "[DEBUG] Pools même partition: $pools_in_part"
-  fi
 done
 
 echo -e "\n[INFO] Audit terminé."
