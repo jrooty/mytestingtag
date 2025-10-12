@@ -1,8 +1,12 @@
 #!/bin/bash
-# Version DEBUG du script expandSubcollections
-# Montre les profils trouvés et les champs C3D pour vérification.
+# Audit complet des Virtual Servers avec expandSubcollections=true
+# Détection des profils server-ssl et C3D actif
+# Compatible jq sans regex (F5), un seul appel REST, mode debug optionnel
 
 set -euo pipefail
+
+DEBUG=0
+[[ "${1:-}" == "--debug" ]] && DEBUG=1
 
 F5_URL="http://localhost:8100/mgmt/tm/ltm/virtual?expandSubcollections=true"
 AUTH="admin:"
@@ -12,6 +16,7 @@ trap 'rm -f "$TMP_VS"' EXIT
 echo "[INFO] Lecture des Virtual Servers (expandSubcollections=true)..."
 curl -sS --insecure -u "$AUTH" "$F5_URL" -o "$TMP_VS"
 
+# Vérifie JSON
 if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
   echo "[ERR] Réponse non JSON. Extrait :"
   head -n 20 "$TMP_VS"
@@ -19,7 +24,7 @@ if ! jq -e . >/dev/null 2>&1 <"$TMP_VS"; then
 fi
 
 printf "\n%-25s %-40s %-35s %-8s\n" "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D"
-printf "%s\n" "─────────────────────────────────────────────────────────────────────────────────────────────"
+printf "%s\n" "──────────────────────────────────────────────────────────────────────────────────────────────"
 
 jq -r '
   .items[]? |
@@ -37,47 +42,52 @@ jq -r '
   ssl_name="-"
   c3d_status="-"
 
-  # Liste tous les profils
   profiles_json=$(_jq '.profiles')
-  echo -e "\n[DEBUG] VS: $vs_path"
-  echo "$profiles_json" | jq -r '.[]?.name'
 
-  # Cherche le profil server-ssl
+  if (( DEBUG )); then
+    echo -e "\n[DEBUG] VS: $vs_path"
+    echo "$profiles_json" | jq -r '.[]?.name'
+  fi
+
   count=$(echo "$profiles_json" | jq 'length')
   if [ "$count" -gt 0 ]; then
     for idx in $(seq 0 $((count - 1))); do
       name=$(echo "$profiles_json" | jq -r ".[$idx].name // empty")
       ctx=$(echo "$profiles_json" | jq -r ".[$idx].context // empty")
-      low_name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link // empty" | sed 's#\.\./##g')
 
-      if [[ "$low_name" == *"server-ssl"* ]] && { [ "$ctx" = "serverside" ] || [ -z "$ctx" ]; }; then
+      if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
         ssl_name="$name"
-        echo "[DEBUG] -> Profil server-ssl trouvé : $ssl_name (context=$ctx)"
-        echo "[DEBUG] -> Champs du profil :"
-        echo "$profiles_json" | jq -r ".[$idx]"
+
+        if (( DEBUG )); then
+          echo "[DEBUG] -> Profil server-ssl trouvé : $ssl_name (context=$ctx)"
+          echo "[DEBUG] -> Lien : $link"
+        fi
+
+        # Lecture du contenu du profil déjà expandu (même JSON)
+        c3d_status=$(jq -r --arg VS "$vs_path" --arg SSL "$ssl_name" '
+          .items[]
+          | select(.fullPath == $VS)
+          | .profilesReference.items[]
+          | select(.name == $SSL)
+          | if ((.clientCertCA? // "") != "none" and .clientCertCA != null)
+            or ((.c3dCA? // "") != "none" and .c3dCA != null)
+            or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
+            or ((.c3d? // "") != "none" and .c3d != null)
+            then "ON"
+            else "OFF"
+            end
+        ' "$TMP_VS")
+
+        if (( DEBUG )); then
+          echo "[DEBUG] -> C3D check : $c3d_status"
+        fi
         break
       fi
     done
   fi
 
-  # Vérifie les champs C3D
-  if [ "$ssl_name" != "-" ]; then
-    c3d_status=$(jq -r --arg VS "$vs_path" --arg SSL "$ssl_name" '
-      .items[]
-      | select(.fullPath == $VS)
-      | .profilesReference.items[]
-      | select(.name == $SSL and ((.context == "serverside") or (.context == null)))
-      | if ((.clientCertCA? // "") != "none" and .clientCertCA != null)
-        or ((.c3dCA? // "") != "none" and .c3dCA != null)
-        or ((.c3dCaCerts? // "") != "none" and .c3dCaCerts != null)
-        or ((.c3d? // "") != "none" and .c3d != null)
-        then "ON"
-        else "OFF"
-        end
-    ' "$TMP_VS")
-  fi
-
   printf "%-25s %-40s %-35s %-8s\n" "$part" "$vs_name" "$ssl_name" "$c3d_status"
 done
 
-echo -e "\n[INFO] Fin du debug."
+echo -e "\n[INFO] Audit terminé."
