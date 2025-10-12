@@ -1,6 +1,6 @@
 #!/bin/bash
-# Audit complet : VS C3D + test TCP / TLS / mTLS sur les pool members
-# Version stable (mêmes boucles jq) + couleurs et numérotation
+# Audit complet VS C3D + test TCP / TLS / mTLS sur les pool members
+# Version : combinée (même logique qu’avant + formatage coloré post-traitement)
 # HTTP 8100, admin:
 
 set -euo pipefail
@@ -14,17 +14,12 @@ for arg in "$@"; do
   esac
 done
 
-# Couleurs
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
-
-# Certificats client pour mTLS (optionnel)
 CLIENT_CERT="client.crt"
 CLIENT_KEY="client.key"
 CA_FILE="ca.crt"
 USE_MTLS=0
 [[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
-# URLs F5
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
 AUTH="admin:"
@@ -36,42 +31,54 @@ TMP_POOL=$(mktemp)
 TMP_SSL=$(mktemp)
 trap 'rm -f "$TMP_VS" "$TMP_POOL" "$TMP_SSL"' EXIT
 
+# --- Phase 1 : collecte des résultats (inchangée) ---
+{
 echo "[INFO] Lecture des Virtual Servers..."
 curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 
 echo "[INFO] Lecture des Pools et de leurs membres..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-vs_counter=0
-
-# Parcours des VS
-for vs_path in $(jq -r '.items[].fullPath' "$TMP_VS"); do
+jq -r '
+  .items[]? |
+  {
+    vs: .fullPath,
+    pool: (if .pool == null then "-" else .pool end),
+    profiles: (if .profilesReference.items == null then [] else .profilesReference.items end)
+  } | @base64
+' "$TMP_VS" | while read -r row; do
+  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
+  vs_path=$(_jq '.vs')
   part="${vs_path%/*}"; part="${part#/}"
   vs_name="${vs_path##*/}"
 
   ssl_name="-"
   c3d_status="OFF"
+  profiles_json=$(_jq '.profiles')
+  count=$(echo "$profiles_json" | jq 'length')
 
-  profiles=$(jq -r --arg vs "$vs_path" '.items[] | select(.fullPath==$vs) | .profilesReference.items[].nameReference.link?' "$TMP_VS" 2>/dev/null || true)
-  for link in $profiles; do
-    if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
-      if [[ "$link" == http* ]]; then
+  if [ "$count" -gt 0 ]; then
+    for idx in $(seq 0 $((count - 1))); do
+      link=$(echo "$profiles_json" | jq -r ".[$idx].nameReference.link")
+      if [[ "$link" == *"ltm/profile/server-ssl/"* ]]; then
+        [[ "$link" == http* ]] || link="$BASE$link"
         link=$(echo "$link" | sed 's#https://localhost#http://localhost:8100#g')
-      else
-        link="$BASE$link"
+        curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
+        sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
+        [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
+        break
       fi
-      curl -sS --insecure -u "$AUTH" -o "$TMP_SSL" "$link" 2>/dev/null || continue
-      sslC3d=$(jq -r '.sslC3d' <"$TMP_SSL" 2>/dev/null || echo "")
-      [[ "${sslC3d,,}" == "enabled" ]] && c3d_status="ON"
-    fi
-  done
+    done
+  fi
 
-  (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]] && continue
+  if (( FILTER_C3D_ONLY )) && [[ "$c3d_status" != "ON" ]]; then
+    continue
+  fi
 
-  ((vs_counter++))
-  echo -e "\n${BOLD}#${vs_counter} Partition:${RESET} ${part}  ${BOLD}| VS:${RESET} ${vs_name}  ${BOLD}| C3D:${RESET} ${c3d_status}"
+  # Affiche d’abord l’en-tête VS (sera formaté ensuite)
+  echo "#VS# ${part} ${vs_name} ${c3d_status}"
 
-  # Liste des membres des pools dans la même partition
+  # Liste des members
   jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
@@ -86,9 +93,7 @@ for vs_path in $(jq -r '.items[].fullPath' "$TMP_VS"); do
       ] | join("\t")
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       [ -z "$ip" ] && continue
-
       tcp_res="KO"; tls_res="KO"; mtls_res="KO"
-
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
         if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
@@ -103,17 +108,29 @@ for vs_path in $(jq -r '.items[].fullPath' "$TMP_VS"); do
           fi
         fi
       fi
-
-      [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}$tcp_res${RESET}" || tcp_col="${RED}$tcp_res${RESET}"
-      [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}$tls_res${RESET}" || tls_col="${RED}$tls_res${RESET}"
-      case "$mtls_res" in
-        OK) mtls_col="${GREEN}$mtls_res${RESET}";;
-        REQ) mtls_col="${YELLOW}$mtls_res${RESET}";;
-        *) mtls_col="${RED}$mtls_res${RESET}";;
-      esac
-
-      echo -e "    ${ip}:${port}   TCP=${tcp_col}   TLS=${tls_col}   mTLS=${mtls_col}"
+      echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
   done
 done
 
-echo -e "\n[INFO] Audit complet terminé."
+} | awk '
+BEGIN {
+  red="\033[31m"; green="\033[32m"; yellow="\033[33m"; bold="\033[1m"; reset="\033[0m"
+  vsnum=0
+}
+# ligne d’entête de VS
+/^#VS#/ {
+  vsnum++; split($0,a," "); part=a[2]; vs=a[3]; c3d=a[4];
+  printf("\n%s#%d%s Partition: %s  |  VS: %s  |  C3D: %s\n", bold, vsnum, reset, part, vs, c3d);
+  next
+}
+# ligne de résultat member
+{
+  part=$1; vs=$2; ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
+  if (tcp=="OK") tcp=green tcp reset; else tcp=red tcp reset;
+  if (tls=="OK") tls=green tls reset; else tls=red tls reset;
+  if (mtls=="OK") mtls=green mtls reset;
+  else if (mtls=="REQ") mtls=yellow mtls reset;
+  else mtls=red mtls reset;
+  printf("    %s:%s   TCP=%s   TLS=%s   mTLS=%s\n", ip, port, tcp, tls, mtls);
+}
+END { print "\n[INFO] Audit complet terminé." }'
