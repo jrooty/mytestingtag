@@ -1,89 +1,33 @@
 #!/bin/bash
-# Test simple de connexion TCP, TLS et mTLS + affichage certificat
-# Compatible OpenSSL 1.0.2
+# Test affichage certificat serveur
+# Usage: ./test_cert.sh ip:port [sni]
 
 TARGET="$1"
 SNI="$2"
-
-CLIENT_CERT="client.crt"
-CLIENT_KEY="client.key"
-CA_FILE="ca.crt"
-USE_MTLS=0
-[[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
-
-if [[ -z "$TARGET" ]]; then
-  echo "Usage: $0 <ip:port> [sni]"
-  exit 1
-fi
 
 IP="${TARGET%%:*}"
 PORT="${TARGET##*:}"
 [[ -z "$SNI" ]] && SNI="$IP"
 
-echo "[INFO] Test connexion : ${IP}:${PORT} (SNI=${SNI})"
+echo "[INFO] Connexion à ${IP}:${PORT} (SNI=${SNI})"
+TMP=$(mktemp)
+
+# Capture brute
+openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null >"$TMP" 2>&1
+
+echo
+echo "[DEBUG] Extrait du flux brut :"
+grep -A2 "BEGIN CERTIFICATE" "$TMP" | head -n 10
 echo
 
-tcp_res="KO"; tls_res="KO"; mtls_res="KO"
+# Extraction premier certificat dans un autre fichier
+awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" > "${TMP}.crt"
 
-# Test TCP
-if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
-  tcp_res="OK"
-
-  # Test TLS simple
-  if openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 | grep -q "BEGIN CERTIFICATE"; then
-    tls_res="OK"
-  fi
-
-  # Test mTLS si fichiers présents
-  if (( USE_MTLS )); then
-    if openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
-         -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>&1 | grep -q "BEGIN CERTIFICATE"; then
-      mtls_res="OK"
-    else
-      mtls_res="REQ"
-    fi
-  fi
-fi
-
-GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
-[[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
-[[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
-case "$mtls_res" in
-  OK) mtls_col="${GREEN}OK${RESET}" ;;
-  REQ) mtls_col="${YELLOW}REQ${RESET}" ;;
-  *) mtls_col="${RED}KO${RESET}" ;;
-esac
-
-echo -e "${BOLD}Résultats:${RESET} TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
-echo
-
-# ----- Affichage certificat serveur -----
-if [[ "$tls_res" == "OK" ]]; then
+if [[ -s "${TMP}.crt" ]]; then
   echo "[INFO] Détails certificat serveur :"
-  openssl s_client -connect "$IP:$PORT" -servername "$SNI" -showcerts </dev/null 2>&1 \
-    | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
-    | openssl x509 -noout \
-        -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null \
-    | sed 's/^/  /'
-  echo
+  openssl x509 -in "${TMP}.crt" -noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null | sed 's/^/  /'
+else
+  echo "[ERREUR] Aucun certificat extrait !"
 fi
 
-# ----- CA acceptées -----
-echo "[INFO] CA acceptées par le serveur (si fournies) :"
-openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
-  | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}'
-echo
-
-# ----- Infos locales mTLS -----
-if (( USE_MTLS )); then
-  echo "[INFO] Matériel client mTLS local :"
-  subj_client=$(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')
-  iss_client=$(openssl x509 -in "$CLIENT_CERT" -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
-  subj_ca=$(openssl x509 -in "$CA_FILE"     -noout -subject 2>/dev/null | sed 's/^subject= *//')
-  iss_ca=$(openssl x509 -in "$CA_FILE"      -noout -issuer  2>/dev/null | sed 's/^issuer= *//')
-  echo "  Client cert (subject): ${subj_client}"
-  echo "  Client cert (issuer) : ${iss_client}"
-  echo "  CA locale (subject)  : ${subj_ca}"
-  echo "  CA locale (issuer)   : ${iss_ca}"
-  echo
-fi
+rm -f "$TMP" "${TMP}.crt"
