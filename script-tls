@@ -1,35 +1,23 @@
 #!/bin/bash
-# Test affichage certificat serveur (corrigé pour OpenSSL 1.0.2)
-
-TARGET="$1"
+IPPORT="$1"
 SNI="$2"
+[[ -z "$SNI" ]] && SNI="${IPPORT%%:*}"
 
-IP="${TARGET%%:*}"
-PORT="${TARGET##*:}"
-[[ -z "$SNI" ]] && SNI="$IP"
-
-echo "[INFO] Connexion à ${IP}:${PORT} (SNI=${SNI})"
 TMP=$(mktemp)
+CERT=$(mktemp)
+trap 'rm -f "$TMP" "$CERT"' EXIT
 
-# Capture brute
-openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null >"$TMP" 2>&1
+echo "[INFO] Connexion à $IPPORT (SNI=$SNI)"
+openssl s_client -connect "$IPPORT" -servername "$SNI" -showcerts </dev/null >"$TMP" 2>&1
 
-echo
-echo "[DEBUG] Extrait du flux brut :"
-grep -A2 "BEGIN CERTIFICATE" "$TMP" | head -n 10
-echo
-
-# Extraction + nettoyage des \r
 awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" \
-  | tr -d '\r' > "${TMP}.crt"
+  | tr -d '\r' > "$CERT"
 
-if [[ -s "${TMP}.crt" ]]; then
+if [[ -s "$CERT" ]]; then
   echo "[INFO] Détails certificat serveur :"
-  openssl x509 -in "${TMP}.crt" -noout \
+  openssl x509 -in "$CERT" -noout \
     -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null \
     | sed 's/^/  /'
 else
   echo "[ERREUR] Aucun certificat extrait !"
 fi
-
-rm -f "$TMP" "${TMP}.crt"
