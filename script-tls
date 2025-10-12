@@ -1,6 +1,5 @@
 #!/bin/bash
-# Test affichage certificat serveur
-# Usage: ./test_cert.sh ip:port [sni]
+# Test affichage certificat serveur (corrigé pour OpenSSL 1.0.2)
 
 TARGET="$1"
 SNI="$2"
@@ -20,12 +19,15 @@ echo "[DEBUG] Extrait du flux brut :"
 grep -A2 "BEGIN CERTIFICATE" "$TMP" | head -n 10
 echo
 
-# Extraction premier certificat dans un autre fichier
-awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" > "${TMP}.crt"
+# Extraction + nettoyage des \r
+awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' "$TMP" \
+  | tr -d '\r' > "${TMP}.crt"
 
 if [[ -s "${TMP}.crt" ]]; then
   echo "[INFO] Détails certificat serveur :"
-  openssl x509 -in "${TMP}.crt" -noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null | sed 's/^/  /'
+  openssl x509 -in "${TMP}.crt" -noout \
+    -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName 2>/dev/null \
+    | sed 's/^/  /'
 else
   echo "[ERREUR] Aucun certificat extrait !"
 fi
