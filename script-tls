@@ -1,8 +1,139 @@
 #!/bin/bash
 # Audit complet VS + test TCP / TLS / mTLS sur les pool members
 # Version stable + délai configurable + logique inversée (--all-vs)
+# Ajout du mode direct --target avec gestion mTLS=N/A
 
 set -euo pipefail
+
+DEBUG=0
+ALL_VS=0
+SLEEP_MS=200  # Délai par défaut : 200 ms
+TARGET=""
+SNI=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG=1 ;;
+    --all-vs) ALL_VS=1 ;;
+    --sleep-ms=*)
+      SLEEP_MS="${arg#*=}"
+      ;;
+    --target=*)
+      TARGET="${arg#*=}"
+      ;;
+    --sni=*)
+      SNI="${arg#*=}"
+      ;;
+  esac
+done
+
+# Conversion millisecondes → secondes
+SLEEP_SEC=$(awk "BEGIN { printf \"%.3f\", $SLEEP_MS / 1000 }")
+
+CLIENT_CERT="client.crt"
+CLIENT_KEY="client.key"
+CA_FILE="ca.crt"
+USE_MTLS=0
+[[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
+
+# =========================
+# MODE DIRECT --target
+# =========================
+if [[ -n "$TARGET" ]]; then
+  IP="${TARGET%%:*}"
+  PORT="${TARGET##*:}"
+  [[ -z "$SNI" ]] && SNI="$IP"
+
+  echo "[INFO] Mode direct --target : ${IP}:${PORT}"
+  echo
+
+  tcp_res="KO"; tls_res="KO"; mtls_res="N/A"
+
+  # --- Test TCP ---
+  if timeout 3 bash -c "echo > /dev/tcp/$IP/$PORT" 2>/dev/null; then
+    tcp_res="OK"
+
+    # --- Test TLS simple ---
+    if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>/dev/null \
+         | grep -q "BEGIN CERTIFICATE"; then
+      tls_res="OK"
+    fi
+
+    # --- Test mTLS ---
+    if (( USE_MTLS )); then
+      if timeout 8 openssl s_client -connect "$IP:$PORT" -servername "$SNI" \
+           -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null \
+           | grep -q "BEGIN CERTIFICATE"; then
+        mtls_res="OK"
+      else
+        mtls_res="REQ"
+      fi
+    else
+      # Détecte si le serveur demande un certificat client
+      if openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
+           | grep -q "Acceptable client certificate CA names"; then
+        mtls_res="REQ"
+      else
+        mtls_res="N/A"
+      fi
+    fi
+  fi
+
+  GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BOLD="\033[1m"; RESET="\033[0m"
+  [[ "$tcp_res" == "OK" ]] && tcp_col="${GREEN}OK${RESET}" || tcp_col="${RED}KO${RESET}"
+  [[ "$tls_res" == "OK" ]] && tls_col="${GREEN}OK${RESET}" || tls_col="${RED}KO${RESET}"
+  case "$mtls_res" in
+    OK) mtls_col="${GREEN}OK${RESET}" ;;
+    REQ) mtls_col="${YELLOW}REQ${RESET}" ;;
+    N/A) mtls_col="N/A" ;;
+    *) mtls_col="${RED}KO${RESET}" ;;
+  esac
+
+  echo -e "${BOLD}Cible:${RESET} ${IP}:${PORT}   ${BOLD}SNI:${RESET} ${SNI}"
+  echo -e "${BOLD}Résultats:${RESET}  TCP=${tcp_col}  TLS=${tls_col}  mTLS=${mtls_col}"
+  echo
+
+  if [[ "$tls_res" == "OK" ]]; then
+    echo "[INFO] Détails certificat serveur :"
+    openssl s_client -connect "${IP}:${PORT}" -servername "${SNI}" -showcerts </dev/null 2>/dev/null \
+      | awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' \
+      | tr -d '\r' \
+      | openssl x509 -noout -subject -issuer -dates -fingerprint -sha256 2>/dev/null \
+      | sed 's/^/  /'
+    echo
+  fi
+
+  if (( USE_MTLS )); then
+    echo "[INFO] Matériel client mTLS local :"
+    subj_client=$(openssl x509 -in "$CLIENT_CERT" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_client=$(openssl x509 -in "$CLIENT_CERT" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
+    subj_ca=$(openssl x509 -in "$CA_FILE" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss_ca=$(openssl x509 -in "$CA_FILE" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
+    echo "  Client cert (subject): ${subj_client}"
+    echo "  Client cert (issuer) : ${iss_client}"
+    echo "  CA locale (subject)  : ${subj_ca}"
+    echo "  CA locale (issuer)   : ${iss_ca}"
+    echo
+
+    echo "[INFO] (Best effort) CA acceptées par le serveur :"
+    cas=$(openssl s_client -connect "$IP:$PORT" -servername "$SNI" </dev/null 2>&1 \
+      | awk '/Acceptable client certificate CA names/{flag=1;next} flag && NF{print "  "$0} flag && /^$/{flag=0}')
+    if [[ -n "$cas" ]]; then
+      echo "$cas"
+    else
+      echo "  (non disponible ou non fourni par le serveur)"
+    fi
+    echo
+  else
+    echo "[INFO] mTLS non activé localement (fichiers manquants: $CLIENT_CERT, $CLIENT_KEY, $CA_FILE)."
+  fi
+
+  exit 0
+fi
+
+# =========================
+# MODE NORMAL F5 (inchangé)
+# =========================
 
 DEBUG=0
 ALL_VS=0
@@ -91,7 +222,6 @@ jq -r '
     done
   fi
 
-  # 🧠 logique inversée : on garde par défaut uniquement les VS C3D=ON
   if (( !ALL_VS )) && [[ "$c3d_status" != "ON" ]]; then
     continue
   fi
@@ -112,26 +242,30 @@ jq -r '
       ] | join("\t")
   ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
       [ -z "$ip" ] && continue
-      tcp_res="KO"; tls_res="KO"; mtls_res="KO"
+      tcp_res="KO"; tls_res="KO"; mtls_res="N/A"
 
       if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
         tcp_res="OK"
-        if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
+        if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"; then
           tls_res="OK"
         fi
         if (( USE_MTLS )); then
           if timeout 5 openssl s_client -connect "$ip:$port" \
-              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep "BEGIN.CERTIFICATE" >/dev/null 2>&1; then
+              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"; then
             mtls_res="OK"
           else
             mtls_res="REQ"
+          fi
+        else
+          if openssl s_client -connect "$ip:$port" </dev/null 2>&1 | grep -q "Acceptable client certificate CA names"; then
+            mtls_res="REQ"
+          else
+            mtls_res="N/A"
           fi
         fi
       fi
 
       echo "${part} ${vs_name} ${ip} ${port} ${tcp_res} ${tls_res} ${mtls_res}"
-
-      # 💤 Délai configurable
       sleep "$SLEEP_SEC"
   done
 done
@@ -148,12 +282,12 @@ BEGIN {
 }
 # Pool members
 {
-  part=$1; vs=$2; ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
+  ip=$3; port=$4; tcp=$5; tls=$6; mtls=$7;
   if (tcp=="OK") tcp=green tcp reset; else tcp=red tcp reset;
   if (tls=="OK") tls=green tls reset; else tls=red tls reset;
   if (mtls=="OK") mtls=green mtls reset;
   else if (mtls=="REQ") mtls=yellow mtls reset;
-  else mtls=red mtls reset;
+  else mtls="N/A";
   printf("    %s:%s   TCP=%s   TLS=%s   mTLS=%s\n", ip, port, tcp, tls, mtls);
 }
 END { print "\n[INFO] Audit complet terminé." }'
