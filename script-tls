@@ -1,6 +1,6 @@
 #!/bin/bash
-# Audit des VS avec C3D activé → liste les pools + pool members (IP:port)
-# Compatible jq minimal (pas de regex, pas de //)
+# Audit complet : VS C3D + test TCP / TLS / mTLS sur les pool members
+# Compatible jq F5 (pas de regex, pas de //)
 # HTTP 8100, admin:
 # Options :
 #   --debug      → logs détaillés
@@ -17,6 +17,14 @@ for arg in "$@"; do
     --c3d-only) FILTER_C3D_ONLY=1 ;;
   esac
 done
+
+# Vars mTLS optionnelles
+CLIENT_CERT="client.crt"
+CLIENT_KEY="client.key"
+CA_FILE="ca.crt"
+
+USE_MTLS=0
+[[ -f "$CLIENT_CERT" && -f "$CLIENT_KEY" && -f "$CA_FILE" ]] && USE_MTLS=1
 
 F5_HOST="localhost:8100"
 BASE="http://$F5_HOST"
@@ -35,10 +43,10 @@ curl -sS --insecure -u "$AUTH" "$VS_URL" -o "$TMP_VS"
 echo "[INFO] Lecture des Pools et de leurs membres..."
 curl -sS --insecure -u "$AUTH" "$POOL_URL" -o "$TMP_POOL"
 
-printf "\n%-25s %-40s %-35s %-8s %-80s\n" \
-  "PARTITION" "VS_NAME" "SERVER_SSL_PROFILE" "C3D" "POOL_MEMBERS (IP:PORT)"
+printf "\n%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
+  "PARTITION" "VS_NAME" "POOL_MEMBER" "PORT" "TCP" "TLS" "mTLS"
 printf "%s\n" \
-  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+  "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 
 jq -r '
   .items[]? |
@@ -91,44 +99,51 @@ jq -r '
     continue
   fi
 
-  # Recherche pools même partition + membres IP:PORT
-  pools_json=$(jq -r --arg part "$part" '
+  # Récupération des membres des pools de la même partition
+  jq -r --arg part "$part" '
     .items[]
     | select(.fullPath != null and (.fullPath | startswith("/" + $part + "/")))
-    | {pool: .name, members: (if .membersReference.items == null then [] else .membersReference.items end)}
-    | @base64
-  ' "$TMP_POOL")
+    | .membersReference.items[]?
+    | {
+        addr: (if .address != null then .address
+               elif .addr != null then .addr
+               elif (.name|split(":")|length>0) then (.name|split(":")[0])
+               else "unknown" end),
+        port: (if .port != null and .port != 0 then (.port|tostring)
+               elif (.name|split(":")|length>1) then (.name|split(":")[1])
+               else "unknown" end)
+      } | @tsv
+  ' "$TMP_POOL" | while IFS=$'\t' read -r ip port; do
+      tcp_res="KO"
+      tls_res="KO"
+      mtls_res="KO"
 
-  pool_members_display=""
-  while read -r pool_row; do
-    [ -z "$pool_row" ] && continue
-    _p() { echo "$pool_row" | base64 --decode | jq -r "$1"; }
-    pool_name=$(_p '.pool')
+      # Test TCP
+      if timeout 3 bash -c "echo > /dev/tcp/$ip/$port" 2>/dev/null; then
+        tcp_res="OK"
+        # Test TLS simple
+        if timeout 5 openssl s_client -connect "$ip:$port" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
+          tls_res="OK"
+        else
+          tls_res="KO"
+        fi
+        # Test mTLS (si fichiers présents)
+        if (( USE_MTLS )); then
+          if timeout 5 openssl s_client -connect "$ip:$port" \
+              -cert "$CLIENT_CERT" -key "$CLIENT_KEY" -CAfile "$CA_FILE" </dev/null 2>/dev/null | grep -q "-----BEGIN CERTIFICATE-----"; then
+            mtls_res="OK"
+          else
+            mtls_res="KO"
+          fi
+        fi
+      else
+        tcp_res="KO"
+      fi
 
-    # Extraction IP:PORT sans regex
-    members=$(_p '.members | map(
-      (if (.address != null and .address != "") then .address
-       elif (.addr != null and .addr != "") then .addr
-       else (if (.name|split(":")|length>1) then (.name|split(":")[0]) else .name end)
-       end)
-      + ":" +
-      (if (.port != null and .port != 0)
-        then (.port|tostring)
-        else (if (.name|split(":")|length>1) then (.name|split(":")[1]) else "unknown" end)
-       end)
-    ) | join(" ")')
+      printf "%-20s %-35s %-35s %-6s %-8s %-8s %-8s\n" \
+        "$part" "$vs_name" "$ip" "$port" "$tcp_res" "$tls_res" "$mtls_res"
+  done
 
-    if [ -z "$members" ]; then
-      members="(aucun membre)"
-    fi
-    pool_members_display+="[$pool_name: $members] "
-  done <<< "$pools_json"
-
-  [ -z "$pool_members_display" ] && pool_members_display="(aucun pool)"
-  pool_members_display=$(echo "$pool_members_display" | sed 's/ *$//')
-
-  printf "%-25s %-40s %-35s %-8s %-80s\n" \
-    "$part" "$vs_name" "$ssl_name" "$c3d_status" "$pool_members_display"
 done
 
-echo -e "\n[INFO] Audit terminé."
+echo -e "\n[INFO] Audit complet terminé."
