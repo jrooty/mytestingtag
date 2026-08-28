@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: librechat-config
+  namespace: agentgateway-system
+data:
+  librechat.yaml: |
+    version: 1.2.1
+    cache: true
+    endpoints:
+      custom:
+        - name: "agentgateway"
+          apiKey: "placeholder"
+          baseURL: "http://agentgateway-proxy.agentgateway-system.svc.cluster.local/v1"
+          models:
+            default: ["gpt-4o", "gpt-4o-mini"]
+            fetch: false
+          titleConvo: true
+          titleModel: "gpt-4o-mini"
+          modelDisplayLabel: "agentgateway"
+
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  namespace: agentgateway-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo:8.0.20
+        ports:
+        - containerPort: 27017
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: agentgateway-system
+spec:
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: librechat
+  namespace: agentgateway-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: librechat
+  template:
+    metadata:
+      labels:
+        app: librechat
+    spec:
+      containers:
+      - name: librechat
+        image: registry.librechat.ai/danny-avila/librechat-dev:latest
+        ports:
+        - containerPort: 3080
+        env:
+        - name: MONGO_URI
+          value: "mongodb://mongodb.agentgateway-system.svc.cluster.local:27017/LibreChat"
+        - name: DOMAIN_CLIENT
+          value: "http://localhost:30080"
+        - name: DOMAIN_SERVER
+          value: "http://localhost:30080"
+        - name: NO_INDEX
+          value: "true"
+        - name: ALLOW_REGISTRATION
+          value: "true"
+        - name: OPENAI_API_KEY
+          value: "user_provided"
+        - name: JWT_SECRET
+          value: "REPLACE_ME_64_HEX_CHARS"
+        - name: JWT_REFRESH_SECRET
+          value: "REPLACE_ME_64_HEX_CHARS"
+        - name: CREDS_KEY
+          value: "REPLACE_ME_64_HEX_CHARS"
+        - name: CREDS_IV
+          value: "REPLACE_ME_32_HEX_CHARS"
+        volumeMounts:
+        - name: librechat-config
+          mountPath: /app/librechat.yaml
+          subPath: librechat.yaml
+      volumes:
+      - name: librechat-config
+        configMap:
+          name: librechat-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: librechat
+  namespace: agentgateway-system
+spec:
+  type: NodePort
+  selector:
+    app: librechat
+  ports:
+  - port: 3080
+    targetPort: 3080
+    nodePort: 30080
+    protocol: TCP
+
+kubectl apply -f librechat-configmap.yaml
+kubectl apply -f mongodb.yaml
+kubectl apply -f librechat.yaml
+
