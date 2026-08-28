@@ -66,3 +66,37 @@ nodes:
     hostPort: 30277
     protocol: TCP
 
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-cors-policy
+  namespace: agentgateway-system # Ajuste le namespace si besoin
+spec:
+  # Cible l'HTTPRoute ou la Gateway exposant ton serveur MCP
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: mcp-server-route
+  traffic:
+    cors:
+      # Autorise l'origin de ton MCP Inspector (ex: localhost, IP de pod, DNS Ingress)
+      allowOrigins:
+        - "http://localhost:8080"
+        - "http://mcp-inspector.example.com"
+        # Utilise "*" uniquement pour du dev local
+        # - "*" 
+      allowMethods:
+        - GET
+        - POST
+        - OPTIONS
+      allowHeaders:
+        - Content-Type
+        - Authorization
+        - Mcp-Session-Id
+        - MCP-Protocol-Version
+        - Last-Event-ID
+      exposeHeaders:
+        - Mcp-Session-Id
+      allowCredentials: true
+
+
