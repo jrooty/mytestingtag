@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-anthropic-code
+  namespace: default
+data:
+  mock_anthropic.py: |
+    from flask import Flask, request, jsonify
+    import uuid
+
+    app = Flask(__name__)
+
+    @app.route("/v1/messages", methods=["POST"])
+    def messages():
+        body = request.get_json(force=True, silent=True) or {}
+        return jsonify({
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Ceci est une réponse mock Anthropic."}],
+            "model": body.get("model", "claude-3-5-haiku-latest"),
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 8}
+        })
+
+    @app.route("/healthz", methods=["GET"])
+    def healthz():
+        return jsonify({"status": "ok"})
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8000)
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-anthropic
+  namespace: default
+  labels:
+    app: mock-anthropic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-anthropic
+  template:
+    metadata:
+      labels:
+        app: mock-anthropic
+    spec:
+      containers:
+        - name: mock-anthropic
+          image: python:3.12-slim
+          command: ["sh", "-c"]
+          args:
+            - "pip install --no-cache-dir flask && python /app/mock_anthropic.py"
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: code
+              mountPath: /app
+      volumes:
+        - name: code
+          configMap:
+            name: mock-anthropic-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-anthropic
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: mock-anthropic
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30093
+      protocol: TCP
+
