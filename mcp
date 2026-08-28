@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-inspector
+  namespace: default
+  labels:
+    app: mcp-inspector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-inspector
+  template:
+    metadata:
+      labels:
+        app: mcp-inspector
+    spec:
+      containers:
+        - name: mcp-inspector
+          image: ghcr.io/modelcontextprotocol/inspector:latest
+          ports:
+            - containerPort: 6274
+            - containerPort: 6277
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: CLIENT_PORT
+              value: "6274"
+            - name: SERVER_PORT
+              value: "6277"
+            - name: MCP_AUTO_OPEN_ENABLED
+              value: "false"
+            - name: DANGEROUSLY_OMIT_AUTH
+              value: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-inspector
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: mcp-inspector
+  ports:
+    - name: ui
+      port: 6274
+      targetPort: 6274
+      nodePort: 30274
+      protocol: TCP
+    - name: proxy
+      port: 6277
+      targetPort: 6277
+      nodePort: 30277
+      protocol: TCP
+
+
+
+nodes:
+- role: control-plane
+  extraPortMappings:
+  - containerPort: 30274
+    hostPort: 30274
+    protocol: TCP
+  - containerPort: 30277
+    hostPort: 30277
+    protocol: TCP
+
