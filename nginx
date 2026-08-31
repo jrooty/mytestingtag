@@ -1,0 +1,46 @@
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+# si le node n'a pas déjà le label ingress-ready (posé normalement via extraPortMappings à la création du cluster)
+kubectl get nodes
+kubectl label node <nom-du-node> ingress-ready=true --overwrite
+
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=120s
+
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout tls.key -out tls.crt \
+  -subj "/CN=mcp-inspector.local" \
+  -addext "subjectAltName=DNS:mcp-inspector.local"
+
+kubectl create secret tls mcp-inspector-tls \
+  --cert=tls.crt --key=tls.key \
+  -n <namespace-inspector>
+
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-inspector
+  namespace: <namespace-inspector>
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - mcp-inspector.local
+    secretName: mcp-inspector-tls
+  rules:
+  - host: mcp-inspector.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: <service-inspector>
+            port:
+              number: 6274
+
+
