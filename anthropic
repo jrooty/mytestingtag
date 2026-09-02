@@ -6,3 +6,25 @@ metadata:
 type: Opaque
 stringData:
   key: "sk-ant-xxxxxxxxxxxxxxxxxxxx"
+
+
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: anthropic-public-access
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: anthropic
+  traffic:
+    auth:
+      apiKey:
+        secretRef:
+          name: public-clients-apikeys
+    rateLimits:
+      local:
+        - requests: 20
+          unit: Minute
+
