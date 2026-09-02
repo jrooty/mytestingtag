@@ -1,3 +1,6 @@
+
+
+
 apiVersion: v1
 kind: Secret
 metadata:
@@ -5,7 +8,7 @@ metadata:
   namespace: agentgateway-system
 type: Opaque
 stringData:
-  key: "-ant-api03-rfBQ2MgrLGN0WbgZPKKvpJzgUeM3kkUHgaKpQzmJdvFeMRqLVr2-vzf735n8i7brH36ui5KY-B93WYdS-WuhFw-3N-4GAAA"
+  Authorization: ant-api03-rfBQ2MgrLGN0WbgZPKKvpJzgUeM3kkUHgaKpQzmJdvFeMRqLVr2-vzf735n8i7brH36ui5KY-B93WYdS-WuhFw-3N-4GAAA
 
 
 apiVersion: agentgateway.dev/v1alpha1
