@@ -1,2 +1,20 @@
 AQ.
 Ab8RN6IpDHb4CyGEILaqqxXMHtzz_FvHTVRdUO4bODYM6wio9g
+
+
+
+curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent" \
+  -H 'Content-Type: application/json' \
+  -H 'X-goog-api-key: HTVRdUO4bODYM6wio9g' \
+  -X POST \
+  -d '{
+    "contents": [
+      {
+        "parts": [
+          {
+            "text": "Explain how AI works in a few words"
+          }
+        ]
+      }
+    ]
+  }'
